@@ -105,11 +105,11 @@ function createBot(botId) {
     let RETRY_DELAY_MS = 5000;
     let COOLDOWN_MS = 60000;
 
-    // Wishlist check: how long to let the page's network calls settle, and then how long to wait
-    // for the "Clear Wishlist" button before deciding the wishlist is empty. Raise these if the
-    // site is slow (e.g. many bots running at once).
-    const WISHLIST_SETTLE_MS = 8000;
-    const WISHLIST_WAIT_MS = 6000;
+    // Wishlist check: how long to wait for the "Clear Wishlist" button before the wishlist is
+    // judged empty. If WISHLIST_DOUBLE_CHECK is true, the page is reloaded ONCE and checked again
+    // before trusting "empty" (costs a few seconds per round; set to false to skip it).
+    const WISHLIST_WAIT_MS = 4000;
+    const WISHLIST_DOUBLE_CHECK = true;
 
     // How many times to click "Add to Wishlist" if the Proceed popup does not appear.
     const ADD_TO_WISHLIST_ATTEMPTS = 3;
@@ -381,25 +381,37 @@ function createBot(botId) {
      * If the wishlist box has an item (the "Clear Wishlist" button is visible),
      * clears it and confirms the popup. Does nothing when the wishlist is empty.
      */
+    async function describeWishlist(page, when) {
+        const html = await page.locator('#wishlist-box').first().evaluate((el) => el.outerHTML)
+            .then((t) => t.replace(/\s+/g, ' ').slice(0, 300))
+            .catch(() => 'no #wishlist-box element on the page');
+        console.log(`   [wishlist diagnostics, ${when}] url=${page.url()}`);
+        console.log(`   [wishlist diagnostics, ${when}] box: ${html}`);
+        console.log(`   [wishlist diagnostics, ${when}] recent requests: ${slotApiDiagnostics.slice(-8).join(' | ') || 'none seen'}`);
+    }
+
     async function clearWishlistIfPresent(page) {
         console.log('--- CHECKING WISHLIST ---');
         try {
-            // Any visible button inside the wishlist box whose text contains "clear".
-            // .first() avoids a "strict mode violation" if the page has more than one such button.
-            const clearBtn = page.locator('#wishlist-box button:visible').filter({ hasText: /clear/i }).first();
+            // Same selector as the original script (.first() only guards against duplicates).
+            const clearBtn = page.locator('#wishlist-box button:has-text("Clear Wishlist")').first();
+            const appears = async (ms) => {
+                try { await clearBtn.waitFor({ state: 'visible', timeout: ms }); return true; } catch (e) { return false; }
+            };
 
-            // The wishlist box is filled by a request AFTER the page opens. With several bots
-            // running, that request can take longer than a few seconds, so first let the page's
-            // network calls finish, and only then decide whether the wishlist is empty.
-            await page.waitForLoadState('networkidle', { timeout: WISHLIST_SETTLE_MS }).catch(() => {});
+            let found = await appears(WISHLIST_WAIT_MS);
 
-            try {
-                await clearBtn.waitFor({ state: 'visible', timeout: WISHLIST_WAIT_MS });
-            } catch (e) {
-                const boxText = await page.locator('#wishlist-box').first().innerText({ timeout: 2000 })
-                    .then((t) => t.replace(/\s+/g, ' ').trim().slice(0, 120))
-                    .catch(() => 'wishlist box not found');
-                console.log(`Wishlist is empty. Continuing. (wishlist box shows: "${boxText || 'nothing'}")`);
+            if (!found && WISHLIST_DOUBLE_CHECK) {
+                await describeWishlist(page, 'first look');
+                console.log('Wishlist looks empty. Reloading the page once to double-check...');
+                await page.reload();
+                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+                found = await appears(WISHLIST_WAIT_MS);
+            }
+
+            if (!found) {
+                await describeWishlist(page, 'final');
+                console.log('Wishlist is empty. Continuing.');
                 return;
             }
 
