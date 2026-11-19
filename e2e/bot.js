@@ -105,6 +105,12 @@ function createBot(botId) {
     let RETRY_DELAY_MS = 5000;
     let COOLDOWN_MS = 60000;
 
+    // Wishlist check: how long to let the page's network calls settle, and then how long to wait
+    // for the "Clear Wishlist" button before deciding the wishlist is empty. Raise these if the
+    // site is slow (e.g. many bots running at once).
+    const WISHLIST_SETTLE_MS = 8000;
+    const WISHLIST_WAIT_MS = 6000;
+
     // How many times to click "Add to Wishlist" if the Proceed popup does not appear.
     const ADD_TO_WISHLIST_ATTEMPTS = 3;
 
@@ -378,13 +384,22 @@ function createBot(botId) {
     async function clearWishlistIfPresent(page) {
         console.log('--- CHECKING WISHLIST ---');
         try {
-            const clearBtn = page.locator('#wishlist-box button:has-text("Clear Wishlist")');
+            // Any visible button inside the wishlist box whose text contains "clear".
+            // .first() avoids a "strict mode violation" if the page has more than one such button.
+            const clearBtn = page.locator('#wishlist-box button:visible').filter({ hasText: /clear/i }).first();
 
-            // Give the wishlist box a moment to render; if no button appears, it's empty
+            // The wishlist box is filled by a request AFTER the page opens. With several bots
+            // running, that request can take longer than a few seconds, so first let the page's
+            // network calls finish, and only then decide whether the wishlist is empty.
+            await page.waitForLoadState('networkidle', { timeout: WISHLIST_SETTLE_MS }).catch(() => {});
+
             try {
-                await clearBtn.waitFor({ state: 'visible', timeout: 3000 });
+                await clearBtn.waitFor({ state: 'visible', timeout: WISHLIST_WAIT_MS });
             } catch (e) {
-                console.log('Wishlist is empty. Continuing.');
+                const boxText = await page.locator('#wishlist-box').first().innerText({ timeout: 2000 })
+                    .then((t) => t.replace(/\s+/g, ' ').trim().slice(0, 120))
+                    .catch(() => 'wishlist box not found');
+                console.log(`Wishlist is empty. Continuing. (wishlist box shows: "${boxText || 'nothing'}")`);
                 return;
             }
 
