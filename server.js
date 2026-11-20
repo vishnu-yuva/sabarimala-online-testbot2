@@ -25,7 +25,7 @@ const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov
 const BOT_COUNT = 4;
 const bots = {};
 for (let i = 1; i <= BOT_COUNT; i++) {
-    bots[i] = { id: i, running: false, logs: [], username: '', runner: createBot(i) };
+    bots[i] = { id: i, running: false, logs: [], progress: null, username: '', runner: createBot(i) };
 }
 const clients = new Set();
 
@@ -61,6 +61,7 @@ function stamp(text) {
 }
 
 function emit(botId, type, data) {
+    if (type === 'progress') bots[botId].progress = data;
     if (type === 'log') {
         data = stamp(data);
         const b = bots[botId];
@@ -73,14 +74,14 @@ function emit(botId, type, data) {
 
 function startBot(botId, cfg) {
     const b = bots[botId];
-    b.running = true; b.logs = []; b.username = cfg.username;
+    b.running = true; b.logs = []; b.progress = null; b.username = cfg.username;
     emit(botId, 'status', { running: true });
     for (const other of Object.values(bots)) {
         if (other.id !== botId && other.running && other.username === cfg.username) {
             emit(botId, 'log', `⚠️ Bot ${other.id} is running with the SAME account. The wishlist belongs to the account, so the two bots can clear each other's wishlist. Use a different account per bot.`);
         }
     }
-    b.runner.run(cfg, (line) => emit(botId, 'log', line))
+    b.runner.run(cfg, (line) => emit(botId, 'log', line), (prog) => emit(botId, 'progress', prog))
         .catch((e) => emit(botId, 'log', `🛑 ${e.message}`))
         .finally(() => { b.running = false; emit(botId, 'status', { running: false }); });
 }
@@ -150,7 +151,7 @@ http.createServer(async (req, res) => {
     if (url === '/api/events') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
         const init = {};
-        for (const b of Object.values(bots)) init[b.id] = { running: b.running, logs: b.logs };
+        for (const b of Object.values(bots)) init[b.id] = { running: b.running, logs: b.logs, progress: b.progress };
         res.write(`data: ${JSON.stringify({ type: 'init', data: { bots: init } })}\n\n`);
         clients.add(res);
         return req.on('close', () => clients.delete(res));
