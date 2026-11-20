@@ -45,6 +45,18 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--mute);font-size:13px}
 .err{color:#b3261e;font-size:14px;display:none;white-space:pre-line;border:1px solid #b3261e;border-radius:8px;padding:10px 14px;margin-top:20px}
 .log{background:var(--logbg);color:var(--logink);border-radius:8px;padding:12px 14px;height:340px;overflow:auto;font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
 .view>.log{margin-top:20px}
+.prog{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.prog:empty{display:none}
+.pane .prog{margin:0 0 8px;padding:8px 10px;font-size:13px}
+.prog .sum{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;font-weight:600}
+.prog .sum .ok{color:var(--ok)}.prog .sum .wait{color:var(--go)}
+.prog .step{font-size:13px;color:var(--mute);margin:2px 0 8px}
+.prog table{width:100%;border-collapse:collapse;font-size:13.5px}
+.prog th{text-align:left;color:var(--mute);font-weight:500;font-size:12px;padding:3px 8px 3px 0}
+.prog td{padding:4px 8px 4px 0;border-top:1px solid var(--line)}
+.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line);color:var(--mute)}
+.badge.booked{color:var(--ok);border-color:var(--ok)}
+.badge.booking{color:var(--go);border-color:var(--go)}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 .pane{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}
@@ -119,6 +131,7 @@ function panelHTML(n){const p=`b${n}-`;return `
 </div>
 <div class="err" id="${p}err" role="alert"></div>
 <div class="bar"><button class="go" id="${p}go">Start Bot ${n}</button><button class="stop" id="${p}stop" disabled>Stop Bot ${n}</button><span class="state" id="${p}state">Idle</span></div>
+<div class="prog" id="${p}prog"></div>
 <div class="log" id="${p}log" aria-live="polite"></div>`}
 
 (function build(){
@@ -129,7 +142,7 @@ function panelHTML(n){const p=`b${n}-`;return `
   }
   tabs.insertAdjacentHTML('beforeend',`<button class="tab" data-view="all">All consoles</button><span class="sp"></span><button class="stop" id="stopAll">Stop all bots</button>`);
   let grid='';
-  for(let n=1;n<=N;n++)grid+=`<div class="pane"><div class="head"><span class="dot" id="gdot${n}"></span><b>Bot ${n}</b><span class="state" id="gstate${n}">Idle</span><button class="stop" id="gstop${n}" disabled>Stop</button></div><div class="log" id="glog${n}" aria-live="polite"></div></div>`;
+  for(let n=1;n<=N;n++)grid+=`<div class="pane"><div class="head"><span class="dot" id="gdot${n}"></span><b>Bot ${n}</b><span class="state" id="gstate${n}">Idle</span><button class="stop" id="gstop${n}" disabled>Stop</button></div><div class="prog" id="gprog${n}"></div><div class="log" id="glog${n}" aria-live="polite"></div></div>`;
   views.insertAdjacentHTML('beforeend',`<div class="view" id="view-all"><div class="grid">${grid}</div></div>`);
 })();
 
@@ -198,11 +211,28 @@ function addLog(n,t){for(const l of state[n].logEls){
   if(end)l.scrollTop=l.scrollHeight}}
 function clearLog(n){state[n].logEls.forEach(l=>l.textContent='')}
 
+const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function fmtTime(iso){if(!iso)return '';const d=new Date(iso);return d.toLocaleDateString([], {day:'2-digit',month:'short'})+' '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+function renderProgress(n,pr){
+ let html='';
+ if(pr&&pr.items&&pr.items.length){
+  const total=pr.items.length,booked=pr.items.filter(i=>i.status==='booked').length,left=total-booked;
+  const label={pending:'Waiting',booking:'In progress',booked:'Booked'};
+  html=`<div class="sum"><span>Pilgrims: ${total}</span><span class="ok">Booked: ${booked}</span><span class="wait">Remaining: ${left}</span></div>`
+   +(pr.step?`<div class="step">${esc(pr.step)}</div>`:'')
+   +`<table><thead><tr><th>Pilgrim row</th><th>Status</th><th>Booked at</th><th>Date</th><th>Slot</th></tr></thead><tbody>`
+   +pr.items.map(i=>`<tr><td>Row ${i.row}${i.label?` <span class="step" style="margin:0">(${esc(i.label)})</span>`:''}</td><td><span class="badge ${i.status}">${label[i.status]||i.status}</span></td><td>${i.status==='booked'?esc(fmtTime(i.bookedAt)):'-'}</td><td>${i.status!=='pending'?esc(i.date||'-'):'-'}</td><td>${i.status!=='pending'?esc(i.slot||'-'):'-'}</td></tr>`).join('')
+   +`</tbody></table>`;
+ }
+ for(const id of [`b${n}-prog`,`gprog${n}`])$(id).innerHTML=html;
+}
+
 const es=new EventSource('/api/events');
 es.onmessage=e=>{const m=JSON.parse(e.data);
- if(m.type==='init'){for(let n=1;n<=N;n++){const b=m.data.bots[n]||{running:false,logs:[]};clearLog(n);b.logs.forEach(t=>addLog(n,t));setRunning(n,b.running)}}
+ if(m.type==='init'){for(let n=1;n<=N;n++){const b=m.data.bots[n]||{running:false,logs:[]};clearLog(n);b.logs.forEach(t=>addLog(n,t));setRunning(n,b.running);renderProgress(n,b.progress)}}
  else if(m.type==='log')addLog(m.bot,m.data);
- else if(m.type==='status'){if(m.data.running)clearLog(m.bot);setRunning(m.bot,m.data.running)}};
+ else if(m.type==='progress')renderProgress(m.bot,m.data);
+ else if(m.type==='status'){if(m.data.running){clearLog(m.bot);renderProgress(m.bot,null)}setRunning(m.bot,m.data.running)}};
 es.onopen=()=>{};
 es.onerror=()=>{for(let n=1;n<=N;n++){$(`b${n}-state`).textContent='Server not reachable'}};
 
