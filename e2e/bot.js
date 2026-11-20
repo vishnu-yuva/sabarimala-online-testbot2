@@ -12,6 +12,21 @@ function createBot(botId) {
     };
     let STOPPED = false;
     let activeBrowser = null;
+
+    // ---- Live booking progress (shown at the top of the console in the UI) ----
+    // One entry per pilgrim row: status = 'pending' | 'booking' | 'booked'.
+    let progressFn = () => {};
+    let progress = { items: [], step: '', round: 0, session: 0 };
+    let lastDate = '';   // date picked in the current round, e.g. "Nov 24 2026"
+    let lastSlot = '';   // slot picked in the current round, e.g. "05:00 - 06:00"
+    const emitProgress = () => { try { progressFn(JSON.parse(JSON.stringify(progress))); } catch (e) { /* never break the bot */ } };
+    const setStep = (text) => { progress.step = text; emitProgress(); };
+    const setStatus = (rows, status, extra) => {
+        for (const it of progress.items) {
+            if (rows.includes(it.row)) Object.assign(it, { status }, extra || {});
+        }
+        emitProgress();
+    };
     let slotApiDiagnostics = [];
 
     // Set these as environment variables, or replace the placeholders below.
@@ -205,6 +220,8 @@ function createBot(botId) {
     async function runBookingBot() {
         let remaining = [...PILGRIM_ROWS]; // pilgrim rows still NOT confirmed booked
         for (const k of Object.keys(pilgrimIdentity)) delete pilgrimIdentity[k];
+        progress = { items: PILGRIM_ROWS.map((row) => ({ row, status: 'pending' })), step: 'Starting', round: 0, session: 0 };
+        emitProgress();
         let failures = 0;   // failed attempts in a row (reset after a success or after the cool-down)
         let round = 0;
         let session = 0;
@@ -212,6 +229,8 @@ function createBot(botId) {
         // Outer loop = one browser session per pass. It only ends when everyone is booked or Stop is pressed.
         while (remaining.length > 0 && !STOPPED) {
             session++;
+            progress.session = session;
+            setStep(`Session ${session}: opening a fresh browser and logging in`);
             let browser = null;
             try {
                 console.log(`\n######## SESSION ${session}: opening a fresh browser, login starts from scratch ########`);
@@ -221,6 +240,8 @@ function createBot(botId) {
 
                 while (remaining.length > 0 && !STOPPED) {
                     round++;
+                    progress.round = round;
+                    lastDate = ''; lastSlot = '';
                     console.log(`\n==================== ROUND ${round} ====================`);
                     console.log(`Pilgrims still to book (rows): ${remaining.join(', ')}`);
 
@@ -235,6 +256,8 @@ function createBot(botId) {
                         // Confirmed booked -> remove them from the remaining list.
                         remaining = remaining.filter((r) => !bookedRows.includes(r));
                         failures = 0;
+                        setStatus(bookedRows, 'booked', { bookedAt: new Date().toISOString(), date: lastDate, slot: lastSlot });
+                        setStep(remaining.length ? `Booked ${bookedRows.length}. Waiting to book the remaining ${remaining.length}` : 'All pilgrims booked');
                         console.log(`✅ Booked row(s): ${bookedRows.join(', ')}. Remaining: ${remaining.length ? remaining.join(', ') : 'none'}`);
                         if (remaining.length > 0) {
                             console.log('ℹ️ Some pilgrims are still left. Next round starts from a fresh browser and a fresh login.');
@@ -243,6 +266,9 @@ function createBot(botId) {
                     } catch (err) {
                         if (STOPPED) break;
                         failures++;
+                        // Pilgrims that were "in progress" in this round go back to waiting.
+                        setStatus(remaining, 'pending', { slot: '', date: '' });
+                        setStep(`Round ${round} failed. Retrying from login...`);
                         console.error(`⚠️ Round ${round} failed: ${String(err && err.message || err).split('\n')[0]}`);
                         console.log(`Still not booked: rows ${remaining.join(', ')}`);
 
@@ -294,15 +320,18 @@ function createBot(botId) {
      */
     async function runOneRound(page, remaining) {
         console.log('--- STARTING LOGIN & NAVIGATION ---');
+        setStep(`Round ${progress.round}: logging in and clearing the wishlist`);
         await loginAndOpenBookingPage(page); // always clears the wishlist if it has an item
 
         // Date selection (loops/refreshes until the target date is available)
+        setStep(`Round ${progress.round}: waiting for the date to open`);
         const dateSelected = await selectDateOnly(page);
         if (!dateSelected) {
             throw new Error('Failed to select a date.');
         }
 
         // Route + slot. The slot's availability decides how many pilgrims we can book now.
+        setStep(`Round ${progress.round}: selecting route and time slot`);
         const slot = await selectRouteAndSlot(page, remaining.length);
         if (!slot.ok) {
             throw new Error('Failed to select a slot after route selection.');
@@ -310,6 +339,9 @@ function createBot(botId) {
 
         const countThisRound = Math.min(slot.availability, remaining.length);
         const rowsThisRound = remaining.slice(0, countThisRound);
+        lastSlot = slot.time || '';
+        setStatus(rowsThisRound, 'booking', { slot: lastSlot, date: lastDate });
+        setStep(`Round ${progress.round}: booking ${rowsThisRound.length} pilgrim(s) in slot ${lastSlot || '?'}`);
 
         if (countThisRound < remaining.length) {
             console.log(`ℹ️ Only ${slot.availability} seat(s) available but ${remaining.length} pilgrim(s) remain. Booking ${countThisRound} now, the rest in the next round.`);
@@ -337,6 +369,10 @@ function createBot(botId) {
         if (picked.length === 0) {
             throw new Error('No pilgrim could be ticked on the selection page.');
         }
+        for (const it of progress.items) {
+            if (pilgrimIdentity[it.row]) it.label = pilgrimIdentity[it.row].slice(0, 40);
+        }
+        emitProgress();
 
         // Submit on pilgrim page
         await Promise.all([
@@ -346,12 +382,14 @@ function createBot(botId) {
         console.log('Clicked Submit on Pilgrim page and returned to darshan page.');
 
         // Nominee details (every nominee row on the page)
+        setStep(`Round ${progress.round}: filling nominee details`);
         await fillNominees(page, picked);
 
         // "No" for both contribution options
         await selectContributionNo(page);
 
         // Wishlist & checkout steps (throws if the booking is not confirmed)
+        setStep(`Round ${progress.round}: checkout and payment`);
         await handleFinalSteps(page);
 
         return picked.map((p) => p.row);
@@ -618,6 +656,7 @@ function createBot(botId) {
 
                     if (dateCell && await dateCell.isVisible()) {
                         console.log(`✅ Date Available: ${targetDate.label} ${targetDate.year}. Selecting...`);
+                        lastDate = `${targetDate.label} ${targetDate.year}`;
 
                         await Promise.all([
                             page.waitForSelector('.mat-calendar-body', { state: 'hidden', timeout: ACTION_TIMEOUT_MS }),
@@ -742,7 +781,7 @@ function createBot(botId) {
                 await target.click();
                 const availability = chosen.seats === null ? neededCount : chosen.seats;
                 console.log(`✅ Selected slot ${chosen.time} (seats: ${chosen.seats === null ? 'unknown, assuming enough' : chosen.seats}).`);
-                return { ok: true, availability };
+                return { ok: true, availability, time: chosen.time };
             } else {
                 console.log('⚠️ Route selected, but the chosen time slot is not visible.');
                 return { ok: false, availability: 0 };
@@ -1104,8 +1143,9 @@ function createBot(botId) {
     let USE_INSTALLED_CHROME = false;
 
     /** Called by server.js. cfg comes from the UI. */
-    async function run(cfg, logFn) {
+    async function run(cfg, logFn, progFn) {
         LOG = logFn;
+        progressFn = progFn || (() => {});
         STOPPED = false;
         USERNAME = cfg.username; PASSWORD = cfg.password;
         TARGET_DATES = cfg.dates;
