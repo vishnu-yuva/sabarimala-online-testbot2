@@ -45,8 +45,7 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--mute);font-size:13px}
 .err{color:#b3261e;font-size:14px;display:none;white-space:pre-line;border:1px solid #b3261e;border-radius:8px;padding:10px 14px;margin-top:20px}
 .log{background:var(--logbg);color:var(--logink);border-radius:8px;padding:12px 14px;height:340px;overflow:auto;font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
 .view>.log{margin-top:20px}
-.prog{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
-.prog:empty{display:none}
+.prog{margin:0 0 16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
 .pane .prog{margin:0 0 8px;padding:8px 10px;font-size:13px}
 .prog .sum{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;font-weight:600}
 .prog .sum .ok{color:var(--ok)}.prog .sum .wait{color:var(--go)}
@@ -68,7 +67,7 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--mute);font-size:13px}
 .note{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--go);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13.5px;color:var(--mute)}
 </style></head><body>
 <header>
-<h1>Sabarimala booking console<small>4 independent bots, each with its own settings and its own console. Each bot runs in the background with no browser window and never stops until every pilgrim is booked (or you press Stop).</small></h1>
+<h1>Sabarimala booking console<small>4 independent bots, each with its own settings and its own console. Each bot runs in the background with no browser window and never stops until every pilgrim is booked (or you press Stop). <b>UI build: status-panel v2</b></small></h1>
 <nav id="tabs" aria-label="Bots"></nav>
 </header>
 <main id="views"></main>
@@ -83,6 +82,7 @@ const MAXLINES=2000;
 
 /* ---------- build the page ---------- */
 function panelHTML(n){const p=`b${n}-`;return `
+<div class="prog" id="${p}prog"></div>
 <div class="note">Bot ${n} has its own browser and login. Use a <b>different account (or different pilgrims) for each bot</b>: the wishlist belongs to the account, so two bots on the same account would clear each other's wishlist.</div>
 <div class="cols">
 <section>
@@ -131,7 +131,6 @@ function panelHTML(n){const p=`b${n}-`;return `
 </div>
 <div class="err" id="${p}err" role="alert"></div>
 <div class="bar"><button class="go" id="${p}go">Start Bot ${n}</button><button class="stop" id="${p}stop" disabled>Stop Bot ${n}</button><span class="state" id="${p}state">Idle</span></div>
-<div class="prog" id="${p}prog"></div>
 <div class="log" id="${p}log" aria-live="polite"></div>`}
 
 (function build(){
@@ -214,11 +213,11 @@ function clearLog(n){state[n].logEls.forEach(l=>l.textContent='')}
 const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function fmtTime(iso){if(!iso)return '';const d=new Date(iso);return d.toLocaleDateString([], {day:'2-digit',month:'short'})+' '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 function renderProgress(n,pr){
- let html='';
+ let html='<div class="sum"><span>Booking status</span></div><div class="step">Not started. Press Start Bot '+n+' and the booked / remaining pilgrims will show here.</div>';
  if(pr&&pr.items&&pr.items.length){
   const total=pr.items.length,booked=pr.items.filter(i=>i.status==='booked').length,left=total-booked;
   const label={pending:'Waiting',booking:'In progress',booked:'Booked'};
-  html=`<div class="sum"><span>Pilgrims: ${total}</span><span class="ok">Booked: ${booked}</span><span class="wait">Remaining: ${left}</span></div>`
+  html=`<div class="sum"><span>Booking status</span><span>Pilgrims: ${total}</span><span class="ok">Booked: ${booked}</span><span class="wait">Remaining: ${left}</span></div>`
    +(pr.step?`<div class="step">${esc(pr.step)}</div>`:'')
    +`<table><thead><tr><th>Pilgrim row</th><th>Status</th><th>Booked at</th><th>Date</th><th>Slot</th></tr></thead><tbody>`
    +pr.items.map(i=>`<tr><td>Row ${i.row}${i.label?` <span class="step" style="margin:0">(${esc(i.label)})</span>`:''}</td><td><span class="badge ${i.status}">${label[i.status]||i.status}</span></td><td>${i.status==='booked'?esc(fmtTime(i.bookedAt)):'-'}</td><td>${i.status!=='pending'?esc(i.date||'-'):'-'}</td><td>${i.status!=='pending'?esc(i.slot||'-'):'-'}</td></tr>`).join('')
@@ -227,6 +226,7 @@ function renderProgress(n,pr){
  for(const id of [`b${n}-prog`,`gprog${n}`])$(id).innerHTML=html;
 }
 
+for(let n=1;n<=N;n++)renderProgress(n,null);
 const es=new EventSource('/api/events');
 es.onmessage=e=>{const m=JSON.parse(e.data);
  if(m.type==='init'){for(let n=1;n<=N;n++){const b=m.data.bots[n]||{running:false,logs:[]};clearLog(n);b.logs.forEach(t=>addLog(n,t));setRunning(n,b.running);renderProgress(n,b.progress)}}
