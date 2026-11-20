@@ -144,10 +144,24 @@ function createBot(botId) {
 
     /** Opens a brand-new browser (no cookies, so the next step is a fresh login). */
     async function openSession() {
-        // Launch your installed Google Chrome instead of Playwright's bundled Chromium.
+        // Browser choice (the original test.js used your real, installed Google Chrome):
+        //  * "Use my installed Google Chrome" ticked -> real Chrome (best match with the original script).
+        //  * otherwise headless uses Chromium's NEW headless mode (channel 'chromium'), which behaves
+        //    like a normal Chrome window, falling back to the old headless shell if it is missing.
+        // The browser reports its own real user agent: it is NOT overridden any more, because a
+        // made-up user agent that does not match the real browser can make the site answer 403.
         const launchOpts = { headless: HEADLESS };
         if (USE_INSTALLED_CHROME) launchOpts.channel = 'chrome';
-        const browser = await chromium.launch(launchOpts);
+        else if (HEADLESS) launchOpts.channel = 'chromium';
+        let browser;
+        try {
+            browser = await chromium.launch(launchOpts);
+        } catch (e) {
+            if (launchOpts.channel !== 'chromium') throw e;
+            console.log('New headless mode is not available here, using the default headless browser.');
+            delete launchOpts.channel;
+            browser = await chromium.launch(launchOpts);
+        }
         activeBrowser = browser;
         if (STOPPED) {
             await browser.close().catch(() => {});
@@ -155,25 +169,32 @@ function createBot(botId) {
         }
         const page = await browser.newPage({
             viewport: { width: 1366, height: 850 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            locale: 'en-IN',
+            timezoneId: 'Asia/Kolkata',
         });
 
         // All actions and navigations time out after ACTION_TIMEOUT_MS instead of 30 s.
         page.setDefaultTimeout(ACTION_TIMEOUT_MS);
         page.setDefaultNavigationTimeout(ACTION_TIMEOUT_MS);
 
+        const apiNote = (method, url, status) => {
+            let where = hostOf(url);
+            try {
+                const u = new URL(url);
+                // Keep the path for failures and for wishlist calls, so the log shows exactly what failed.
+                if (status === 'failed' || status >= 400 || /wish/i.test(u.pathname)) where = u.hostname + u.pathname;
+            } catch (e) { /* keep host only */ }
+            slotApiDiagnostics.push(`${method} ${where} ${status}`);
+            if (slotApiDiagnostics.length > 30) slotApiDiagnostics.shift();
+        };
         page.on('response', (response) => {
             const request = response.request();
             if (request.resourceType() !== 'xhr' && request.resourceType() !== 'fetch') return;
-            slotApiDiagnostics.push(`${request.method()} ${hostOf(response.url())} ${response.status()}`);
-            if (slotApiDiagnostics.length > 30) slotApiDiagnostics.shift();
+            apiNote(request.method(), response.url(), response.status());
         });
         page.on('requestfailed', (request) => {
             if (request.resourceType() !== 'xhr' && request.resourceType() !== 'fetch') return;
-            const failure = request.failure();
-            const reason = failure && failure.errorText ? `: ${failure.errorText}` : '';
-            slotApiDiagnostics.push(`${request.method()} ${hostOf(request.url())} failed${reason}`);
-            if (slotApiDiagnostics.length > 30) slotApiDiagnostics.shift();
+            apiNote(request.method(), request.url(), 'failed');
         });
         page.on('pageerror', (error) => console.error(`Browser page error: ${error.message}`));
 
@@ -411,6 +432,11 @@ function createBot(botId) {
 
             if (!found) {
                 await describeWishlist(page, 'final');
+                // If the site refused / failed the wishlist request, "empty" is NOT trustworthy.
+                const refused = slotApiDiagnostics.slice(-15).filter((l) => /wish/i.test(l) && (/ failed$/.test(l) || / [45]\d\d$/.test(l)));
+                if (refused.length > 0) {
+                    throw new Error(`The site refused the wishlist request (${refused[refused.length - 1]}), so the wishlist could not be checked.`);
+                }
                 console.log('Wishlist is empty. Continuing.');
                 return;
             }
