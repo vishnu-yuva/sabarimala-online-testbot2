@@ -144,34 +144,35 @@ function createBot(botId) {
 
     /** Opens a brand-new browser (no cookies, so the next step is a fresh login). */
     async function openSession() {
-        // Browser choice (the original test.js used your real, installed Google Chrome):
-        //  * "Use my installed Google Chrome" ticked -> real Chrome (best match with the original script).
-        //  * otherwise headless uses Chromium's NEW headless mode (channel 'chromium'), which behaves
-        //    like a normal Chrome window, falling back to the old headless shell if it is missing.
-        // The browser reports its own real user agent: it is NOT overridden any more, because a
-        // made-up user agent that does not match the real browser can make the site answer 403.
+        // Browser choice:
+        //  * "Use my installed Google Chrome" ticked -> your real Chrome (same as the original test.js).
+        //  * otherwise Playwright's own Chromium.
         const launchOpts = { headless: HEADLESS };
         if (USE_INSTALLED_CHROME) launchOpts.channel = 'chrome';
-        else if (HEADLESS) launchOpts.channel = 'chromium';
-        let browser;
-        try {
-            browser = await chromium.launch(launchOpts);
-        } catch (e) {
-            if (launchOpts.channel !== 'chromium') throw e;
-            console.log('New headless mode is not available here, using the default headless browser.');
-            delete launchOpts.channel;
-            browser = await chromium.launch(launchOpts);
-        }
+        const browser = await chromium.launch(launchOpts);
         activeBrowser = browser;
         if (STOPPED) {
             await browser.close().catch(() => {});
             throw new Error('Stopped');
         }
-        const page = await browser.newPage({
-            viewport: { width: 1366, height: 850 },
-            locale: 'en-IN',
-            timezoneId: 'Asia/Kolkata',
-        });
+
+        let page;
+        try {
+            // A browser running WITHOUT a window announces itself as "HeadlessChrome", and this site then
+            // loads a blank page. So in hidden mode we send the browser's own real user agent with only
+            // that word removed (the original test.js ran with a visible window, so it never had this problem).
+            const pageOpts = { viewport: { width: 1366, height: 850 } };
+            if (HEADLESS) {
+                const probe = await browser.newPage();
+                const realUA = await probe.evaluate(() => navigator.userAgent).catch(() => '');
+                await probe.close().catch(() => {});
+                if (realUA) pageOpts.userAgent = realUA.replace(/Headless/gi, '');
+            }
+            page = await browser.newPage(pageOpts);
+        } catch (e) {
+            await browser.close().catch(() => {}); // never leave a browser running if setup fails
+            throw e;
+        }
 
         // All actions and navigations time out after ACTION_TIMEOUT_MS instead of 30 s.
         page.setDefaultTimeout(ACTION_TIMEOUT_MS);
@@ -403,7 +404,7 @@ function createBot(botId) {
      * clears it and confirms the popup. Does nothing when the wishlist is empty.
      */
     async function describeWishlist(page, when) {
-        const html = await page.locator('#wishlist-box').first().evaluate((el) => el.outerHTML)
+        const html = await page.locator('#wishlist-box').first().evaluate((el) => el.outerHTML, undefined, { timeout: 1500 })
             .then((t) => t.replace(/\s+/g, ' ').slice(0, 300))
             .catch(() => 'no #wishlist-box element on the page');
         console.log(`   [wishlist diagnostics, ${when}] url=${page.url()}`);
@@ -414,6 +415,17 @@ function createBot(botId) {
     async function clearWishlistIfPresent(page) {
         console.log('--- CHECKING WISHLIST ---');
         try {
+            // The wishlist box is part of the booking page. If it never appears, the page itself did
+            // not load (blank page / blocked), which is NOT the same as an empty wishlist.
+            try {
+                await page.waitForSelector('#wishlist-box', { state: 'attached', timeout: 10000 });
+            } catch (e) {
+                const title = await page.title().catch(() => '');
+                const text = await page.locator('body').innerText({ timeout: 3000 })
+                    .then((t) => t.replace(/\s+/g, ' ').trim().slice(0, 200)).catch(() => '');
+                throw new Error(`The booking page did not load (no wishlist box). Page title: "${title}". Page text: "${text || 'blank'}". The site may be blocking this browser.`);
+            }
+
             // Same selector as the original script (.first() only guards against duplicates).
             const clearBtn = page.locator('#wishlist-box button:has-text("Clear Wishlist")').first();
             const appears = async (ms) => {
