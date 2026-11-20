@@ -108,8 +108,8 @@ function createBot(botId) {
     // Wishlist check: how long to wait for the "Clear Wishlist" button before the wishlist is
     // judged empty. If WISHLIST_DOUBLE_CHECK is true, the page is reloaded ONCE and checked again
     // before trusting "empty" (costs a few seconds per round; set to false to skip it).
-    const WISHLIST_WAIT_MS = 4000;
-    const WISHLIST_DOUBLE_CHECK = true;
+    const WISHLIST_WAIT_MS = 3000;
+    const WISHLIST_DOUBLE_CHECK = false; // fresh browser every attempt, so no extra reload is needed
 
     // How many times to click "Add to Wishlist" if the Proceed popup does not appear.
     const ADD_TO_WISHLIST_ATTEMPTS = 3;
@@ -236,21 +236,26 @@ function createBot(botId) {
                         remaining = remaining.filter((r) => !bookedRows.includes(r));
                         failures = 0;
                         console.log(`✅ Booked row(s): ${bookedRows.join(', ')}. Remaining: ${remaining.length ? remaining.join(', ') : 'none'}`);
+                        if (remaining.length > 0) {
+                            console.log('ℹ️ Some pilgrims are still left. Next round starts from a fresh browser and a fresh login.');
+                            break;
+                        }
                     } catch (err) {
                         if (STOPPED) break;
                         failures++;
                         console.error(`⚠️ Round ${round} failed: ${String(err && err.message || err).split('\n')[0]}`);
                         console.log(`Still not booked: rows ${remaining.join(', ')}`);
 
-                        if (failures > MAX_RETRIES) break; // retries used up -> cool-down + fresh login (below)
-
-                        const alive = browser.isConnected() && !page.isClosed();
-                        if (!alive) {
-                            console.log('⚠️ The browser/page was closed unexpectedly. Opening a new one...');
-                            break;
+                        // EVERY failure ends this browser session. The browser is closed in the
+                        // `finally` below (cookies, login, Angular form state are all thrown away)
+                        // and the next attempt opens a brand-new browser and logs in again.
+                        // Reusing the old page was the bug: goto('#/darshan') on a page that is
+                        // already on #/darshan does not reload it, so the old, half-filled form
+                        // (Select Route invalid) was reused.
+                        if (failures <= MAX_RETRIES) {
+                            console.log(`🔁 Retry ${failures}/${MAX_RETRIES} in ${RETRY_DELAY_MS / 1000}s: closing the browser, clearing the session, restarting from LOGIN...`);
                         }
-                        console.log(`🔁 Retry ${failures}/${MAX_RETRIES} in ${RETRY_DELAY_MS / 1000}s (restarts from the first step, wishlist is cleared)...`);
-                        await sleep(RETRY_DELAY_MS);
+                        break;
                     }
                 }
             } catch (err) {
@@ -267,7 +272,7 @@ function createBot(botId) {
             if (STOPPED || remaining.length === 0) break;
 
             if (failures > MAX_RETRIES) {
-                console.log(`\n⏳ ${MAX_RETRIES} retries did not work. Waiting ${COOLDOWN_MS / 1000}s, then restarting the automation from LOGIN with a fresh browser...`);
+                console.log(`\n⏳ ${MAX_RETRIES} retries did not work. Waiting ${COOLDOWN_MS / 1000}s, then restarting from LOGIN with a fresh browser...`);
                 await sleep(COOLDOWN_MS);
                 failures = 0;
             } else {
@@ -1016,6 +1021,13 @@ function createBot(botId) {
         console.log('--- STARTING FINAL CHECKOUT STEPS ---');
 
         const firstProceedButton = page.locator('button:visible:has-text("Proceed")').first();
+
+        // Fail fast: if the route got reset, Add to Wishlist can never work (form is invalid),
+        // so do not waste 3 x 10 s on timeouts. Restart from login instead.
+        const routeNow = await page.$eval(ROUTE_SELECTOR, (el) => el.value).catch(() => null);
+        if (routeNow !== ROUTE_VALUE) {
+            throw new Error(`Route is not selected before Add to Wishlist (value: "${routeNow}"). Restarting from login.`);
+        }
 
         // ---- Phase 1: Add to Wishlist -> wait for the Proceed popup (retry the click if needed) ----
         let popupShown = false;
