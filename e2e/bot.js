@@ -21,11 +21,25 @@ function createBot(botId) {
     let lastSlot = '';   // slot picked in the current round, e.g. "05:00 - 06:00"
     const emitProgress = () => { try { progressFn(JSON.parse(JSON.stringify(progress))); } catch (e) { /* never break the bot */ } };
     const setStep = (text) => { progress.step = text; emitProgress(); };
+    // One-line status printed INTO the console log, so it is visible even if the page has no status panel.
+    const logSummary = () => {
+        const items = progress.items;
+        if (!items.length) return;
+        const clock = (iso) => new Date(iso).toLocaleTimeString([], { hour12: false });
+        const booked = items.filter((i) => i.status === 'booked');
+        const going = items.filter((i) => i.status === 'booking');
+        const waiting = items.filter((i) => i.status === 'pending');
+        console.log(`📊 STATUS: Booked ${booked.length}/${items.length}` +
+            (booked.length ? ` [${booked.map((i) => `row ${i.row} at ${clock(i.bookedAt)}, ${i.date || '-'}, slot ${i.slot || '-'}`).join(' | ')}]` : '') +
+            ` | In progress: ${going.length ? going.map((i) => 'row ' + i.row).join(', ') : 'none'}` +
+            ` | Remaining: ${waiting.length + going.length ? [...going, ...waiting].map((i) => 'row ' + i.row).join(', ') : 'none'}`);
+    };
     const setStatus = (rows, status, extra) => {
         for (const it of progress.items) {
             if (rows.includes(it.row)) Object.assign(it, { status }, extra || {});
         }
         emitProgress();
+        logSummary();
     };
     let slotApiDiagnostics = [];
 
@@ -244,6 +258,7 @@ function createBot(botId) {
                     lastDate = ''; lastSlot = '';
                     console.log(`\n==================== ROUND ${round} ====================`);
                     console.log(`Pilgrims still to book (rows): ${remaining.join(', ')}`);
+                    logSummary();
 
                     try {
                         // Returns rows only after the booking was CONFIRMED (see verifyBookingSuccess).
@@ -1146,6 +1161,7 @@ function createBot(botId) {
     async function run(cfg, logFn, progFn) {
         LOG = logFn;
         progressFn = progFn || (() => {});
+        console.log('Build: status-panel v2 (bot.js)');
         STOPPED = false;
         USERNAME = cfg.username; PASSWORD = cfg.password;
         TARGET_DATES = cfg.dates;
