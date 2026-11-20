@@ -145,7 +145,7 @@ http.createServer(async (req, res) => {
     const url = String(req.url || '').split('?')[0];
 
     if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         return res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
     }
     if (url === '/api/events') {
