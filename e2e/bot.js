@@ -542,8 +542,8 @@ function createBot(botId) {
 
     /** How long to wait for the date picker button after a page load (the site can be slow when busy). */
     const DATE_PAGE_WAIT_MS = 20000;
-    /** After this many "date page did not load" errors in a row, restart from a fresh browser + login. */
-    const DATE_PAGE_MAX_FAILS = 4;
+    /** After this many date-check errors in a row (any step), close the browser and restart from the LOGIN page. */
+    const DATE_PAGE_MAX_FAILS = 10;
 
     /** Logs what the page really looks like (blank? error page? login?) when it does not load. */
     async function describePageState(page) {
@@ -582,7 +582,7 @@ function createBot(botId) {
         const calendarToggleButton = page.locator('mat-datepicker-toggle button').first();
         const calendarBody = page.locator('.mat-calendar-body');
 
-        let pickerFails = 0; // consecutive "date picker never showed up" errors
+        let pickerFails = 0; // consecutive date-check errors (reset as soon as the calendar loads normally)
 
         while (true) {
             if (STOPPED) throw new Error('Stopped');
@@ -590,7 +590,6 @@ function createBot(botId) {
             let stage = 'waiting for the date picker button';
             try {
                 await calendarToggleButton.waitFor({ state: 'visible', timeout: DATE_PAGE_WAIT_MS });
-            pickerFails = 0;
 
                 stage = 'opening the date picker';
                 if (!await calendarBody.isVisible()) {
@@ -599,6 +598,7 @@ function createBot(botId) {
                 stage = 'waiting for the calendar grid';
                 await calendarBody.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
                 console.log('Calendar loaded. Checking available dates...');
+            pickerFails = 0; // the page works again, so the error streak is over
                 stage = 'checking target dates';
 
                 for (const targetDate of TARGET_DATES) {
@@ -732,12 +732,13 @@ function createBot(botId) {
                 if (await page.locator('#email').isVisible().catch(() => false)) {
                     throw new Error('Logged out while waiting for a date (login form is showing). Restarting from login.');
                 }
-                if (stage === 'waiting for the date picker button') {
-                    pickerFails++;
-                    await describePageState(page);
-                    if (pickerFails >= DATE_PAGE_MAX_FAILS) {
-                        throw new Error(`The date page did not load ${pickerFails} times in a row. Restarting from a fresh browser and login.`);
-                    }
+                pickerFails++;
+                if (pickerFails === 1 || pickerFails % 5 === 0) await describePageState(page);
+                console.log(`   (date-check error ${pickerFails}/${DATE_PAGE_MAX_FAILS} in a row)`);
+                if (pickerFails >= DATE_PAGE_MAX_FAILS) {
+                    // The round fails -> this browser is closed -> a NEW browser opens at the login page,
+                    // logs in again and runs every step from the beginning.
+                    throw new Error(`The date page failed ${pickerFails} times in a row (last step: ${stage}). Closing this browser and restarting from the login page.`);
                 }
                 await page.waitForTimeout(refreshPause());
                 await reloadAndReport(page);
