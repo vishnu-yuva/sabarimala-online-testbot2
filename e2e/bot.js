@@ -144,14 +144,13 @@ function createBot(botId) {
     const ADD_TO_WISHLIST_ATTEMPTS = 3;
 
     // --- Booking success check ---
-    // A round counts as BOOKED only when one of these is seen after the final "Proceed":
-    //   1) the page has left the /darshan booking page (e.g. payment gateway or confirmation page), OR
-    //   2) the URL matches BOOKING_SUCCESS_URL_REGEX, OR
-    //   3) the page text matches BOOKING_SUCCESS_TEXT_REGEX.
-    // If none appears within SLOW_WAIT_MS, the round is treated as NOT booked and retried.
-    // Tune these two patterns using the "Final page URL / Final page text" lines in the log.
-    const BOOKING_SUCCESS_URL_REGEX = /payment|ticket|confirm|success|receipt|invoice/i;
-    const BOOKING_SUCCESS_TEXT_REGEX = /booking (is )?(successful|confirmed)|successfully (booked|added)|booking id|ticket (no|number)|transaction id|payment (successful|success)/i;
+    // A round counts as BOOKED ONLY when the feedback popup appears after the final "Proceed":
+    // a popup with the ratings (Excellent / Good / Poor ...) and a single "OK" button.
+    // Anything else (page left /darshan, payment URL, timeout...) is a FAILURE and the whole
+    // flow restarts from a fresh browser and a fresh login.
+    const FEEDBACK_WAIT_MS = 60000; // how long to wait for the popup after the final "Proceed"
+    const FEEDBACK_TEXT_REGEXES = [/excellent/i, /poor/i]; // ALL of these must be visible on the popup
+    const FEEDBACK_OK_SELECTOR = 'button:visible, a.btn:visible, input[type="button"]:visible, input[type="submit"]:visible, .swal2-confirm:visible, .swal-button--confirm:visible';
 
     // Remembers who each pilgrim row is (by its text), so after some pilgrims are booked
     // and the list changes, the remaining ones are still found correctly.
@@ -1027,42 +1026,54 @@ function createBot(botId) {
     }
 
     /**
-     * Waits (up to SLOW_WAIT_MS) for a sign that the booking really went through.
-     * Success = the page left the /darshan booking page, OR the URL matches
-     * BOOKING_SUCCESS_URL_REGEX, OR the page text matches BOOKING_SUCCESS_TEXT_REGEX.
-     * Returns true if confirmed, false if nothing confirmed it in time.
+     * Looks (in the page and all its frames) for the feedback popup: the rating words
+     * (Excellent / Poor ...) must be visible AND there must be a visible "OK" button.
+     * Returns the OK button locator, or null when the popup is not there.
+     */
+    async function findFeedbackPopup(page) {
+        for (const frame of page.frames()) {
+            try {
+                const text = await frame.locator('body').innerText({ timeout: 1500 });
+                if (!FEEDBACK_TEXT_REGEXES.every((re) => re.test(text))) continue;
+                const okButton = frame.locator(FEEDBACK_OK_SELECTOR).filter({ hasText: /^\s*ok\s*$/i }).first();
+                if (await okButton.isVisible().catch(() => false)) return okButton;
+            } catch (e) { /* frame not readable yet, try the next one */ }
+        }
+        return null;
+    }
+
+    /**
+     * Waits (up to FEEDBACK_WAIT_MS) for the feedback popup. This is the ONLY success signal.
+     * When it appears the booking is confirmed and the popup is closed with its OK button.
+     * Returns true if the popup was seen, false otherwise (= booking NOT done).
      */
     async function verifyBookingSuccess(page) {
-        console.log('--- VERIFYING BOOKING ---');
-        const deadline = Date.now() + SLOW_WAIT_MS;
-        let lastUrl = '';
-        let lastText = '';
+        console.log('--- VERIFYING BOOKING (waiting for the feedback popup: Excellent / Good / Poor + OK) ---');
+        const deadline = Date.now() + FEEDBACK_WAIT_MS;
 
         while (Date.now() < deadline) {
             if (STOPPED) throw new Error('Stopped');
 
-            lastUrl = page.url();
-            lastText = normalizeText(await page.locator('body').innerText().catch(() => '')).slice(0, 300);
-
-            const onLogin = /login|signin/i.test(lastUrl);
-            const leftDarshan = !lastUrl.includes('/darshan') && !onLogin;
-            const urlMatch = BOOKING_SUCCESS_URL_REGEX.test(lastUrl);
-            const textMatch = BOOKING_SUCCESS_TEXT_REGEX.test(lastText);
-
-            if (leftDarshan || urlMatch || textMatch) {
-                const why = leftDarshan ? 'page left /darshan' : (urlMatch ? 'success URL matched' : 'success text matched');
-                console.log(`Final page URL: ${lastUrl}`);
-                console.log(`Final page text: ${lastText || 'could not read'}`);
-                console.log(`✅ Booking confirmed (${why}).`);
+            const okButton = await findFeedbackPopup(page);
+            if (okButton) {
+                console.log(`✅ Feedback popup appeared. Booking confirmed. (URL: ${page.url()})`);
+                try {
+                    await okButton.click({ timeout: 5000 });
+                    console.log('Clicked "OK" on the feedback popup.');
+                } catch (e) {
+                    console.log(`ℹ️ Could not click OK on the feedback popup (booking is still counted): ${e.message.split('\n')[0]}`);
+                }
                 return true;
             }
 
             await page.waitForTimeout(1000);
         }
 
-        console.log(`Final page URL: ${lastUrl}`);
-        console.log(`Final page text: ${lastText || 'could not read'}`);
-        console.log('⚠️ No booking confirmation was seen.');
+        const url = page.url();
+        const text = normalizeText(await page.locator('body').innerText().catch(() => '')).slice(0, 300);
+        console.log(`Final page URL: ${url}`);
+        console.log(`Final page text: ${text || 'could not read'}`);
+        console.log('⚠️ The feedback popup never appeared, so this booking is treated as FAILED.');
         return false;
     }
 
@@ -1141,10 +1152,9 @@ function createBot(botId) {
         }
 
         // ---- Phase 3: confirm the booking really happened ----
-        await page.waitForLoadState('networkidle', { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
         const confirmed = await verifyBookingSuccess(page);
         if (!confirmed) {
-            throw new Error('Booking was not confirmed. These pilgrims stay in the remaining list and will be booked again.');
+            throw new Error('Booking not confirmed: the feedback popup (Excellent/Good/Poor + OK) did not appear. These pilgrims stay in the remaining list and will be booked again.');
         }
 
         console.log('--- ✅ BOOKING CONFIRMED FOR THIS ROUND ---');
