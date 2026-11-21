@@ -186,16 +186,12 @@ function createBot(botId) {
 
         let page;
         try {
-            // A browser running WITHOUT a window announces itself as "HeadlessChrome", and this site then
-            // loads a blank page. So in hidden mode we send the browser's own real user agent with only
-            // that word removed (the original test.js ran with a visible window, so it never had this problem).
-            const pageOpts = { viewport: { width: 1366, height: 850 } };
-            if (HEADLESS) {
-                const probe = await browser.newPage();
-                const realUA = await probe.evaluate(() => navigator.userAgent).catch(() => '');
-                await probe.close().catch(() => {});
-                if (realUA) pageOpts.userAgent = realUA.replace(/Headless/gi, '');
-            }
+            // Same browser identity as the old, working bot: a fixed Windows Chrome user agent.
+            // (This also avoids the "HeadlessChrome" name that makes the site load a blank page.)
+            const pageOpts = {
+                viewport: { width: 1366, height: 850 },
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            };
             page = await browser.newPage(pageOpts);
         } catch (e) {
             await browser.close().catch(() => {}); // never leave a browser running if setup fails
@@ -1078,6 +1074,49 @@ function createBot(botId) {
     }
 
     /**
+     * The site sometimes marks "Select Route" as invalid (ng-invalid) after we come back from the
+     * pilgrim page, even though the dropdown still shows the route. Add to Wishlist then silently
+     * does nothing. If that happens, select the route again (with real change events), let the
+     * slots reload and pick the same slot again. Returns true if a repair was done.
+     */
+    async function repairRouteIfInvalid(page) {
+        const state = await page.$eval(ROUTE_SELECTOR, (el) => ({
+            invalid: el.classList.contains('ng-invalid') || el.value === '',
+            value: el.value,
+        })).catch(() => null);
+        if (!state || !state.invalid) return false;
+
+        console.log(`⚠️ The page marks "Select Route" as invalid (value "${state.value}"). Selecting the route again...`);
+        await page.selectOption(ROUTE_SELECTOR, ROUTE_VALUE);
+        await page.$eval(ROUTE_SELECTOR, (el) => {
+            for (const type of ['input', 'change', 'blur']) el.dispatchEvent(new Event(type, { bubbles: true }));
+        }).catch(() => {});
+
+        // Changing the route reloads the slot cards: pick the same slot again.
+        try {
+            await page.waitForSelector(AVAILABLE_SLOT_SELECTOR, { timeout: ACTION_TIMEOUT_MS });
+            await page.waitForTimeout(500);
+            const norm = (t) => String(t).replace(/\s+/g, '');
+            const slots = page.locator(TIME_SLOT_CLICK_PARENT);
+            const n = await slots.count();
+            for (let i = 0; i < n; i++) {
+                const time = ((await slots.nth(i).locator('.slot-dar-3').first().innerText()) || '').trim();
+                if (lastSlot && norm(time) === norm(lastSlot)) {
+                    await slots.nth(i).click();
+                    console.log(`Selected slot ${time} again.`);
+                    break;
+                }
+            }
+        } catch (e) {
+            console.log(`ℹ️ Slots were not reloaded after selecting the route again: ${e.message.split('\n')[0]}`);
+        }
+
+        const stillInvalid = await page.$eval(ROUTE_SELECTOR, (el) => el.classList.contains('ng-invalid')).catch(() => false);
+        console.log(stillInvalid ? '⚠️ Route is still marked invalid.' : '✅ Route is valid again.');
+        return true;
+    }
+
+    /**
      * Handles the wishlist and proceed steps, then CONFIRMS the booking.
      * Throws a normal error if anything is not confirmed, so the round restarts,
      * the wishlist is cleared, and the same pilgrims are tried again.
@@ -1087,12 +1126,8 @@ function createBot(botId) {
 
         const firstProceedButton = page.locator('button:visible:has-text("Proceed")').first();
 
-        // Fail fast: if the route got reset, Add to Wishlist can never work (form is invalid),
-        // so do not waste 3 x 10 s on timeouts. Restart from login instead.
-        const routeNow = await page.$eval(ROUTE_SELECTOR, (el) => el.value).catch(() => null);
-        if (routeNow !== ROUTE_VALUE) {
-            throw new Error(`Route is not selected before Add to Wishlist (value: "${routeNow}"). Restarting from login.`);
-        }
+        // If the route got reset on the way back from the pilgrim page, repair it BEFORE clicking.
+        await repairRouteIfInvalid(page).catch((e) => console.log(`ℹ️ Route repair problem: ${e.message.split('\n')[0]}`));
 
         // ---- Phase 1: Add to Wishlist -> wait for the Proceed popup (retry the click if needed) ----
         let popupShown = false;
@@ -1113,6 +1148,7 @@ function createBot(botId) {
                 popupShown = true;
             } catch (e) {
                 console.log(`⚠️ Proceed popup did not appear after attempt ${attempt}. Page says: ${await pageProblemText(page)}`);
+                await repairRouteIfInvalid(page).catch((e) => console.log(`ℹ️ Route repair problem: ${e.message.split('\n')[0]}`));
                 await page.waitForTimeout(1000);
             }
         }
