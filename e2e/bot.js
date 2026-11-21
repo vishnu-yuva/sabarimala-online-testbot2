@@ -536,6 +536,35 @@ function createBot(botId) {
         );
     }
 
+    /** How long to wait for the date picker button after a page load (the site can be slow when busy). */
+    const DATE_PAGE_WAIT_MS = 20000;
+    /** After this many "date page did not load" errors in a row, restart from a fresh browser + login. */
+    const DATE_PAGE_MAX_FAILS = 4;
+
+    /** Logs what the page really looks like (blank? error page? login?) when it does not load. */
+    async function describePageState(page) {
+        try {
+            const title = await page.title().catch(() => '');
+            const text = await page.locator('body').innerText({ timeout: 2000 })
+                .then((t) => t.replace(/\s+/g, ' ').trim().slice(0, 160)).catch(() => '');
+            const appRoot = await page.locator('app-root').count().catch(() => -1);
+            console.log(`   [page state] url=${page.url()} | title="${title}" | text="${text || 'BLANK PAGE'}" | app-root elements=${appRoot} | recent requests: ${slotApiDiagnostics.slice(-5).join(' | ') || 'none'}`);
+        } catch (e) {
+            console.log(`   [page state] could not read the page: ${e.message.split('\n')[0]}`);
+        }
+    }
+
+    /** Reloads the page and reports an HTTP error status (429 = too many requests, 403 = blocked, 5xx = site down). */
+    async function reloadAndReport(page) {
+        const resp = await page.reload();
+        if (resp && resp.status() >= 400) {
+            console.log(`⚠️ The site answered the page reload with HTTP ${resp.status()} ${resp.statusText()}. ${resp.status() === 429 ? 'The site is limiting how often this IP may load it.' : ''}`);
+        }
+    }
+
+    /** 7 seconds plus a random 0-3 seconds, so several bots do not hit the site in lockstep. */
+    const refreshPause = () => 7000 + Math.floor(Math.random() * 3000);
+
     /**
      * Dynamically navigates the Angular Material calendar to the exact month and year
      * specified in TARGET_DATES and selects the exact target day (only if it is enabled).
@@ -549,12 +578,15 @@ function createBot(botId) {
         const calendarToggleButton = page.locator('mat-datepicker-toggle button').first();
         const calendarBody = page.locator('.mat-calendar-body');
 
+        let pickerFails = 0; // consecutive "date picker never showed up" errors
+
         while (true) {
             if (STOPPED) throw new Error('Stopped');
             let dateFound = false;
             let stage = 'waiting for the date picker button';
             try {
-                await calendarToggleButton.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+                await calendarToggleButton.waitFor({ state: 'visible', timeout: DATE_PAGE_WAIT_MS });
+            pickerFails = 0;
 
                 stage = 'opening the date picker';
                 if (!await calendarBody.isVisible()) {
@@ -684,9 +716,9 @@ function createBot(botId) {
                 } else {
                     // Close the calendar with Escape (clicking the toggle again can be blocked by the overlay)
                     await page.keyboard.press('Escape').catch(() => {});
-                    console.log('No available dates. Refreshing after 7 seconds...');
-                    await page.waitForTimeout(7000);
-                    await page.reload();
+                    console.log('No available dates. Refreshing in about 7 seconds...');
+                    await page.waitForTimeout(refreshPause());
+                    await reloadAndReport(page);
                 }
 
             } catch (err) {
@@ -696,8 +728,15 @@ function createBot(botId) {
                 if (await page.locator('#email').isVisible().catch(() => false)) {
                     throw new Error('Logged out while waiting for a date (login form is showing). Restarting from login.');
                 }
-                await page.waitForTimeout(7000);
-                await page.reload();
+                if (stage === 'waiting for the date picker button') {
+                    pickerFails++;
+                    await describePageState(page);
+                    if (pickerFails >= DATE_PAGE_MAX_FAILS) {
+                        throw new Error(`The date page did not load ${pickerFails} times in a row. Restarting from a fresh browser and login.`);
+                    }
+                }
+                await page.waitForTimeout(refreshPause());
+                await reloadAndReport(page);
             }
         }
     }
