@@ -30,7 +30,7 @@ function createBot(botId) {
         const going = items.filter((i) => i.status === 'booking');
         const waiting = items.filter((i) => i.status === 'pending');
         console.log(`📊 STATUS: Booked ${booked.length}/${items.length}` +
-            (booked.length ? ` [${booked.map((i) => `row ${i.row} at ${clock(i.bookedAt)}, ${i.date || '-'}, slot ${i.slot || '-'}`).join(' | ')}]` : '') +
+            (booked.length ? ` [${booked.map((i) => `row ${i.row} at ${clock(i.bookedAt)}, ${i.date || '-'}, slot ${i.slot || '-'}${i.txnId ? ', txn ' + i.txnId : ''}`).join(' | ')}]` : '') +
             ` | In progress: ${going.length ? going.map((i) => 'row ' + i.row).join(', ') : 'none'}` +
             ` | Remaining: ${waiting.length + going.length ? [...going, ...waiting].map((i) => 'row ' + i.row).join(', ') : 'none'}`);
     };
@@ -144,13 +144,17 @@ function createBot(botId) {
     const ADD_TO_WISHLIST_ATTEMPTS = 3;
 
     // --- Booking success check ---
-    // A round counts as BOOKED ONLY when the feedback popup appears after the final "Proceed":
-    // a popup with the ratings (Excellent / Good / Poor ...) and a single "OK" button.
-    // Anything else (page left /darshan, payment URL, timeout...) is a FAILURE and the whole
+    // A round counts as BOOKED ONLY when the "Booking Confirmation" popup appears after the final
+    // "Proceed" and it says the transaction is successful, e.g.:
+    //   <div class="feedback_form"> Booking Confirmation ... Your transaction is successful with
+    //   Transaction ID:1928712499 ... Please rate Us ... <button id="regi_continue"> OK </button>
+    // If a popup appears but does NOT say that, or nothing appears, the round FAILED and the whole
     // flow restarts from a fresh browser and a fresh login.
     const FEEDBACK_WAIT_MS = 60000; // how long to wait for the popup after the final "Proceed"
-    const FEEDBACK_TEXT_REGEXES = [/excellent/i, /poor/i]; // ALL of these must be visible on the popup
-    const FEEDBACK_OK_SELECTOR = 'button:visible, a.btn:visible, input[type="button"]:visible, input[type="submit"]:visible, .swal2-confirm:visible, .swal-button--confirm:visible';
+    const CONFIRM_POPUP_SELECTOR = '.feedback_form';
+    const CONFIRM_OK_SELECTOR = '.feedback_form button#regi_continue, .feedback_form button.btn-addto-pop';
+    const CONFIRM_SUCCESS_REGEX = /transaction is successful|transaction id\s*:?\s*\d+/i;
+    let lastTransactionId = ''; // Transaction ID read from the popup of the latest confirmed booking
 
     // Remembers who each pilgrim row is (by its text), so after some pilgrims are booked
     // and the list changes, the remaining ones are still found correctly.
@@ -266,7 +270,7 @@ function createBot(botId) {
                         // Confirmed booked -> remove them from the remaining list.
                         remaining = remaining.filter((r) => !bookedRows.includes(r));
                         failures = 0;
-                        setStatus(bookedRows, 'booked', { bookedAt: new Date().toISOString(), date: lastDate, slot: lastSlot });
+                        setStatus(bookedRows, 'booked', { bookedAt: new Date().toISOString(), date: lastDate, slot: lastSlot, txnId: lastTransactionId });
                         setStep(remaining.length ? `Booked ${bookedRows.length}. Waiting to book the remaining ${remaining.length}` : 'All pilgrims booked');
                         console.log(`✅ Booked row(s): ${bookedRows.join(', ')}. Remaining: ${remaining.length ? remaining.join(', ') : 'none'}`);
                         if (remaining.length > 0) {
@@ -1061,44 +1065,59 @@ function createBot(botId) {
     }
 
     /**
-     * Looks (in the page and all its frames) for the feedback popup: the rating words
-     * (Excellent / Poor ...) must be visible AND there must be a visible "OK" button.
-     * Returns the OK button locator, or null when the popup is not there.
+     * Looks (in the page and all its frames) for the booking popup (.feedback_form).
+     * Returns { success, text, okButton } or null when no popup is showing.
+     * success = the popup says "Your transaction is successful ... Transaction ID".
      */
-    async function findFeedbackPopup(page) {
+    async function findConfirmationPopup(page) {
         for (const frame of page.frames()) {
             try {
-                const text = await frame.locator('body').innerText({ timeout: 1500 });
-                if (!FEEDBACK_TEXT_REGEXES.every((re) => re.test(text))) continue;
-                const okButton = frame.locator(FEEDBACK_OK_SELECTOR).filter({ hasText: /^\s*ok\s*$/i }).first();
-                if (await okButton.isVisible().catch(() => false)) return okButton;
+                const popup = frame.locator(CONFIRM_POPUP_SELECTOR).first();
+                if (!(await popup.isVisible().catch(() => false))) continue;
+                const text = ((await popup.innerText({ timeout: 2000 })) || '').replace(/\s+/g, ' ').trim();
+                if (!text) continue;
+                return {
+                    success: CONFIRM_SUCCESS_REGEX.test(text),
+                    text,
+                    okButton: frame.locator(CONFIRM_OK_SELECTOR).filter({ hasText: /^\s*ok\s*$/i }).first(),
+                };
             } catch (e) { /* frame not readable yet, try the next one */ }
         }
         return null;
     }
 
     /**
-     * Waits (up to FEEDBACK_WAIT_MS) for the feedback popup. This is the ONLY success signal.
-     * When it appears the booking is confirmed and the popup is closed with its OK button.
-     * Returns true if the popup was seen, false otherwise (= booking NOT done).
+     * Waits (up to FEEDBACK_WAIT_MS) for the booking popup. This is the ONLY success signal:
+     *   - popup saying "transaction is successful"  -> booked (Transaction ID is logged, OK is clicked)
+     *   - a popup saying anything else              -> failed right away (its text is logged)
+     *   - no popup at all                           -> failed after the wait
+     * Returns true only for a confirmed booking.
      */
     async function verifyBookingSuccess(page) {
-        console.log('--- VERIFYING BOOKING (waiting for the feedback popup: Excellent / Good / Poor + OK) ---');
+        console.log('--- VERIFYING BOOKING (waiting for the "Booking Confirmation" popup) ---');
+        lastTransactionId = '';
         const deadline = Date.now() + FEEDBACK_WAIT_MS;
 
         while (Date.now() < deadline) {
             if (STOPPED) throw new Error('Stopped');
 
-            const okButton = await findFeedbackPopup(page);
-            if (okButton) {
-                console.log(`✅ Feedback popup appeared. Booking confirmed. (URL: ${page.url()})`);
+            const popup = await findConfirmationPopup(page);
+            if (popup && popup.success) {
+                const idMatch = popup.text.match(/transaction id\s*:?\s*(\d+)/i);
+                lastTransactionId = idMatch ? idMatch[1] : '';
+                console.log(`✅ Booking Confirmation popup appeared: ${popup.text.slice(0, 160)}`);
+                console.log(`✅ Booking confirmed. Transaction ID: ${lastTransactionId || 'not found in popup'}`);
                 try {
-                    await okButton.click({ timeout: 5000 });
-                    console.log('Clicked "OK" on the feedback popup.');
+                    await popup.okButton.click({ timeout: 5000 });
+                    console.log('Clicked "OK" on the Booking Confirmation popup.');
                 } catch (e) {
-                    console.log(`ℹ️ Could not click OK on the feedback popup (booking is still counted): ${e.message.split('\n')[0]}`);
+                    console.log(`ℹ️ Could not click OK on the popup (booking is still counted): ${e.message.split('\n')[0]}`);
                 }
                 return true;
+            }
+            if (popup && !popup.success) {
+                console.log(`⚠️ A popup appeared but it does NOT confirm the booking. Popup says: ${popup.text.slice(0, 300)}`);
+                return false;
             }
 
             await page.waitForTimeout(1000);
@@ -1108,7 +1127,7 @@ function createBot(botId) {
         const text = normalizeText(await page.locator('body').innerText().catch(() => '')).slice(0, 300);
         console.log(`Final page URL: ${url}`);
         console.log(`Final page text: ${text || 'could not read'}`);
-        console.log('⚠️ The feedback popup never appeared, so this booking is treated as FAILED.');
+        console.log('⚠️ The Booking Confirmation popup never appeared, so this booking is treated as FAILED.');
         return false;
     }
 
@@ -1271,7 +1290,7 @@ function createBot(botId) {
         // ---- Phase 3: confirm the booking really happened ----
         const confirmed = await verifyBookingSuccess(page);
         if (!confirmed) {
-            throw new Error('Booking not confirmed: the feedback popup (Excellent/Good/Poor + OK) did not appear. These pilgrims stay in the remaining list and will be booked again.');
+            throw new Error('Booking not confirmed: the Booking Confirmation popup ("transaction is successful") did not appear. These pilgrims stay in the remaining list and will be booked again.');
         }
 
         console.log('--- ✅ BOOKING CONFIRMED FOR THIS ROUND ---');
