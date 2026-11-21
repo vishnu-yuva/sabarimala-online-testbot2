@@ -1117,6 +1117,47 @@ function createBot(botId) {
     }
 
     /**
+     * Prints everything needed to tell a BOT problem from a WEBSITE problem when
+     * "Add to Wishlist" does nothing: which form fields the site itself marks invalid,
+     * the state of the button, the slot cards, and the latest wishlist requests.
+     * Also saves a screenshot in ./debug/.
+     */
+    async function dumpWishlistDiagnostics(page, label) {
+        try {
+            const info = await page.evaluate(() => {
+                const clean = (t) => String(t == null ? '' : t).replace(/\s+/g, ' ').trim().slice(0, 40);
+                const invalid = [...document.querySelectorAll('.ng-invalid:not(form)')].map((el) =>
+                    `${el.tagName.toLowerCase()}[name=${el.getAttribute('name') || ''}|formcontrolname=${el.getAttribute('formcontrolname') || ''}|placeholder=${el.getAttribute('placeholder') || ''}] value="${clean(el.value)}"`);
+                const route = document.querySelector('select[name="reportingPlace"]');
+                const addBtn = [...document.querySelectorAll('button#regi_continue')].find((b) => /add to wishlist/i.test(b.innerText));
+                const slots = [...document.querySelectorAll('.slot-media')].slice(0, 6).map((el) => `${clean(el.innerText)} => class="${el.className}"`);
+                const dateInput = document.querySelector('input.mat-datepicker-input, input[matinput]');
+                return {
+                    invalid,
+                    route: route ? `value="${route.value}" class="${route.className}"` : 'no route select on page',
+                    date: dateInput ? `"${dateInput.value}"` : 'no date input found',
+                    addBtn: addBtn ? `disabled=${addBtn.disabled} class="${addBtn.className}"` : 'Add to Wishlist button not found',
+                    slots,
+                    errors: [...document.querySelectorAll('.text-danger, mat-error')].map((el) => clean(el.innerText)).filter(Boolean).length,
+                };
+            });
+            console.log(`   [wishlist diagnostics: ${label}] route: ${info.route}`);
+            console.log(`   [wishlist diagnostics: ${label}] date input: ${info.date}`);
+            console.log(`   [wishlist diagnostics: ${label}] Add to Wishlist button: ${info.addBtn}`);
+            console.log(`   [wishlist diagnostics: ${label}] fields the SITE marks invalid: ${info.invalid.length ? info.invalid.join(' || ') : 'none'}`);
+            console.log(`   [wishlist diagnostics: ${label}] slot cards: ${info.slots.length ? info.slots.join(' || ') : 'none on page'}`);
+            console.log(`   [wishlist diagnostics: ${label}] last requests: ${slotApiDiagnostics.slice(-8).join(' | ') || 'none seen'}`);
+            const fs = require('fs');
+            fs.mkdirSync('debug', { recursive: true });
+            const file = `debug/bot${botId}-wishlist-${Date.now()}.png`;
+            await page.screenshot({ path: file, fullPage: true, timeout: 5000 });
+            console.log(`   [wishlist diagnostics: ${label}] screenshot saved: ${file}`);
+        } catch (e) {
+            console.log(`   [wishlist diagnostics] could not collect: ${e.message.split('\n')[0]}`);
+        }
+    }
+
+    /**
      * Handles the wishlist and proceed steps, then CONFIRMS the booking.
      * Throws a normal error if anything is not confirmed, so the round restarts,
      * the wishlist is cleared, and the same pilgrims are tried again.
@@ -1148,6 +1189,7 @@ function createBot(botId) {
                 popupShown = true;
             } catch (e) {
                 console.log(`⚠️ Proceed popup did not appear after attempt ${attempt}. Page says: ${await pageProblemText(page)}`);
+                if (attempt === 1) await dumpWishlistDiagnostics(page, 'after attempt 1');
                 await repairRouteIfInvalid(page).catch((e) => console.log(`ℹ️ Route repair problem: ${e.message.split('\n')[0]}`));
                 await page.waitForTimeout(1000);
             }
