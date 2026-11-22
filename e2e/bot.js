@@ -334,8 +334,9 @@ function createBot(botId) {
      */
     async function runOneRound(page, remaining) {
         console.log('--- STARTING LOGIN & NAVIGATION ---');
-        setStep(`Round ${progress.round}: logging in and clearing the wishlist`);
-        await loginAndOpenBookingPage(page); // always clears the wishlist if it has an item
+        setStep(`Round ${progress.round}: logging in and checking the wishlist`);
+        const resumedRows = await loginAndOpenBookingPage(page, remaining);
+        if (resumedRows) return resumedRows; // the wishlist item was booked directly (slot was available)
 
         // Date selection (loops/refreshes until the target date is available)
         setStep(`Round ${progress.round}: waiting for the date to open`);
@@ -417,7 +418,7 @@ function createBot(botId) {
      * Initial steps: open the site, login if needed, go to the Virtual-Q booking page,
      * then clear the wishlist if it has an item. Runs at the start of EVERY round.
      */
-    async function loginAndOpenBookingPage(page) {
+    async function loginAndOpenBookingPage(page, remaining) {
         await page.goto('https://sabarimalaonline.org/#/darshan');
 
         let needLogin = false;
@@ -449,11 +450,94 @@ function createBot(botId) {
         }
         console.log('Navigated to Virtual-Q booking page.');
 
-        // Clear any old wishlist item BEFORE doing the normal flow
-        await clearWishlistIfPresent(page);
+        // Wishlist check: if an item is there and its slot is still available, finish that booking
+        // (click Proceed). Otherwise clear it and carry on with the normal flow.
+        const resumedRows = await clearWishlistIfPresent(page, () => resumeFromWishlistIfSlotAvailable(page, remaining));
+        if (resumedRows) return resumedRows;
 
         await page.waitForSelector(ROUTE_SELECTOR, { state: 'visible', timeout: ACTION_TIMEOUT_MS });
         console.log('Booking page elements are stable. Starting checks.');
+    }
+
+    // --- Resume from an existing wishlist item ---
+    // After login: if the wishlist already holds an item AND its slot is still available
+    // (the red #slotMsg text beside "Virtual-Q" is blank), click the wishlist's "Proceed" and finish the
+    // booking from there. If the slot is NOT available (a message is shown), clear the wishlist.
+    const SLOT_MSG_SETTLE_MS = 1500; // the slot message is filled in a moment after the box appears
+    let resumeFailedBefore = false;  // if resuming failed once, the next round clears the wishlist instead
+
+    /**
+     * Compares the wishlist date (shown as dd-mm-yyyy, e.g. "26-11-2026") with the dates set for this bot
+     * (TARGET_DATES). Returns the matching target date, or null if it is different / cannot be read.
+     */
+    function matchWishlistDate(wishlistDate) {
+        const m = String(wishlistDate || '').match(/(\d{1,2})\D+(\d{1,2})\D+(\d{4})/);
+        if (!m) return null;
+        const day = parseInt(m[1], 10), month = parseInt(m[2], 10), year = parseInt(m[3], 10);
+        return TARGET_DATES.find((t) =>
+            parseInt(t.day, 10) === day &&
+            MONTH_NAMES.indexOf(String(t.month).toUpperCase()) + 1 === month &&
+            parseInt(t.year, 10) === year
+        ) || null;
+    }
+
+    async function resumeFromWishlistIfSlotAvailable(page, remaining) {
+        if (resumeFailedBefore) {
+            console.log('ℹ️ The previous attempt to continue from the wishlist failed, so the wishlist will be cleared this time.');
+            resumeFailedBefore = false;
+            return null;
+        }
+
+        await page.waitForTimeout(SLOT_MSG_SETTLE_MS);
+        const box = page.locator('#wishlist-box').first();
+        const slotMsg = await box.locator('#slotMsg').first().innerText({ timeout: 1500 })
+            .then((t) => t.replace(/\s+/g, ' ').trim()).catch(() => '');
+        const details = await box.evaluate((el) => {
+            const out = {};
+            el.querySelectorAll('.wishlist-list li').forEach((li) => {
+                const label = (li.querySelector('b') || {}).innerText;
+                const value = (li.querySelector('.entry') || {}).innerText;
+                if (label) out[label.trim()] = (value || '').replace(/\s+/g, ' ').trim();
+            });
+            return out;
+        }).catch(() => ({}));
+
+        const wlDate = details['Date'] || '';
+        const wlTime = details['Time'] || '';
+        const wlPilgrims = parseInt(details['No. of Pilgrims'], 10);
+        console.log(`Wishlist has an item: date ${wlDate || '?'}, time ${wlTime || '?'}, pilgrims ${Number.isNaN(wlPilgrims) ? '?' : wlPilgrims}. Slot message: "${slotMsg || '(none)'}"`);
+
+        // 1) The wishlist date must be one of the dates set in the bot (the time slot is NOT compared).
+        const matchedDate = matchWishlistDate(wlDate);
+        if (!matchedDate) {
+            console.log(`Wishlist date "${wlDate || 'unreadable'}" is not one of the bot's dates (${TARGET_DATES.map((t) => `${t.label} ${t.year}`).join(', ')}). Clearing the wishlist.`);
+            return null; // caller clears it
+        }
+        console.log(`✅ Wishlist date ${wlDate} matches the bot's date ${matchedDate.label} ${matchedDate.year}.`);
+
+        // 2) The slot of that wishlist item must still be available.
+        if (slotMsg) {
+            console.log('Slot is NOT available for the wishlist item. Clearing the wishlist.');
+            return null; // caller clears it
+        }
+
+        console.log('✅ Slot is available for the wishlist item. Clicking "Proceed" in the wishlist.');
+        const count = Number.isNaN(wlPilgrims) || wlPilgrims < 1 ? remaining.length : Math.min(wlPilgrims, remaining.length);
+        const rows = remaining.slice(0, count);
+        lastDate = `${matchedDate.label} ${matchedDate.year}`; lastSlot = wlTime;
+        setStatus(rows, 'booking', { slot: lastSlot, date: lastDate });
+        setStep(`Round ${progress.round}: continuing from the wishlist (slot ${wlTime || '?'})`);
+
+        try {
+            const wishlistProceed = box.locator('button:has-text("Proceed")').first();
+            await wishlistProceed.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            await checkoutFromProceed(page, wishlistProceed);
+        } catch (err) {
+            resumeFailedBefore = true; // next round: clear the wishlist and book normally
+            err.fromResume = true;
+            throw err;
+        }
+        return rows;
     }
 
     /**
@@ -469,7 +553,7 @@ function createBot(botId) {
         console.log(`   [wishlist diagnostics, ${when}] recent requests: ${slotApiDiagnostics.slice(-8).join(' | ') || 'none seen'}`);
     }
 
-    async function clearWishlistIfPresent(page) {
+    async function clearWishlistIfPresent(page, beforeClear) {
         console.log('--- CHECKING WISHLIST ---');
         try {
             // The wishlist box is part of the booking page. If it never appears, the page itself did
@@ -510,6 +594,12 @@ function createBot(botId) {
                 return;
             }
 
+            // An item IS in the wishlist. The hook may decide to book it instead of clearing it.
+            if (beforeClear) {
+                const handled = await beforeClear();
+                if (handled) return handled;
+            }
+
             await clearBtn.click({ timeout: ACTION_TIMEOUT_MS });
             console.log('Clicked "Clear Wishlist".');
 
@@ -522,7 +612,7 @@ function createBot(botId) {
             await clearBtn.waitFor({ state: 'hidden', timeout: ACTION_TIMEOUT_MS });
             console.log('✅ Wishlist cleared.');
         } catch (err) {
-            console.log(`⚠️ Wishlist clear failed: ${err.message.split('\n')[0]}`);
+            if (!err.fromResume) console.log(`⚠️ Wishlist clear failed: ${err.message.split('\n')[0]}`);
             throw err; // restarts the round so we never continue with a stale wishlist
         }
     }
@@ -1133,49 +1223,6 @@ function createBot(botId) {
     }
 
     /**
-     * The site sometimes marks "Select Route" as invalid (ng-invalid) after we come back from the
-     * pilgrim page, even though the dropdown still shows the route. Add to Wishlist then silently
-     * does nothing. If that happens, select the route again (with real change events), let the
-     * slots reload and pick the same slot again. Returns true if a repair was done.
-     */
-    async function repairRouteIfInvalid(page) {
-        const state = await page.$eval(ROUTE_SELECTOR, (el) => ({
-            invalid: el.classList.contains('ng-invalid') || el.value === '',
-            value: el.value,
-        })).catch(() => null);
-        if (!state || !state.invalid) return false;
-
-        console.log(`⚠️ The page marks "Select Route" as invalid (value "${state.value}"). Selecting the route again...`);
-        await page.selectOption(ROUTE_SELECTOR, ROUTE_VALUE);
-        await page.$eval(ROUTE_SELECTOR, (el) => {
-            for (const type of ['input', 'change', 'blur']) el.dispatchEvent(new Event(type, { bubbles: true }));
-        }).catch(() => {});
-
-        // Changing the route reloads the slot cards: pick the same slot again.
-        try {
-            await page.waitForSelector(AVAILABLE_SLOT_SELECTOR, { timeout: ACTION_TIMEOUT_MS });
-            await page.waitForTimeout(500);
-            const norm = (t) => String(t).replace(/\s+/g, '');
-            const slots = page.locator(TIME_SLOT_CLICK_PARENT);
-            const n = await slots.count();
-            for (let i = 0; i < n; i++) {
-                const time = ((await slots.nth(i).locator('.slot-dar-3').first().innerText()) || '').trim();
-                if (lastSlot && norm(time) === norm(lastSlot)) {
-                    await slots.nth(i).click();
-                    console.log(`Selected slot ${time} again.`);
-                    break;
-                }
-            }
-        } catch (e) {
-            console.log(`ℹ️ Slots were not reloaded after selecting the route again: ${e.message.split('\n')[0]}`);
-        }
-
-        const stillInvalid = await page.$eval(ROUTE_SELECTOR, (el) => el.classList.contains('ng-invalid')).catch(() => false);
-        console.log(stillInvalid ? '⚠️ Route is still marked invalid.' : '✅ Route is valid again.');
-        return true;
-    }
-
-    /**
      * Prints everything needed to tell a BOT problem from a WEBSITE problem when
      * "Add to Wishlist" does nothing: which form fields the site itself marks invalid,
      * the state of the button, the slot cards, and the latest wishlist requests.
@@ -1226,9 +1273,6 @@ function createBot(botId) {
 
         const firstProceedButton = page.locator('button:visible:has-text("Proceed")').first();
 
-        // If the route got reset on the way back from the pilgrim page, repair it BEFORE clicking.
-        await repairRouteIfInvalid(page).catch((e) => console.log(`ℹ️ Route repair problem: ${e.message.split('\n')[0]}`));
-
         // ---- Phase 1: Add to Wishlist -> wait for the Proceed popup (retry the click if needed) ----
         let popupShown = false;
         for (let attempt = 1; attempt <= ADD_TO_WISHLIST_ATTEMPTS && !popupShown; attempt++) {
@@ -1248,9 +1292,15 @@ function createBot(botId) {
                 popupShown = true;
             } catch (e) {
                 console.log(`⚠️ Proceed popup did not appear after attempt ${attempt}. Page says: ${await pageProblemText(page)}`);
-                if (attempt === 1) await dumpWishlistDiagnostics(page, 'after attempt 1');
-                await repairRouteIfInvalid(page).catch((e) => console.log(`ℹ️ Route repair problem: ${e.message.split('\n')[0]}`));
-                await page.waitForTimeout(1000);
+                await dumpWishlistDiagnostics(page, 'popup missing');
+                // Do NOT click again or touch the form: after a successful "Add to Wishlist" the site
+                // resets the booking form (empty route/date, disabled button), so retrying here is useless
+                // and the wishlist is not cleared. Restart from the login page instead; the wishlist check
+                // right after login either finishes this booking (date matches + slot available) or clears it.
+                const siteAccepted = slotApiDiagnostics.some((l) => /addToWishlist\s+2\d\d/i.test(l));
+                throw new Error(siteAccepted
+                    ? 'The site accepted Add to Wishlist but the Proceed popup did not open (the item may be in the wishlist). Restarting from the login page; the wishlist is checked there.'
+                    : 'Add to Wishlist did not open the Proceed popup. Restarting from the login page.');
             }
         }
 
@@ -1261,9 +1311,18 @@ function createBot(botId) {
                 .slice(0, 10);
             console.log(`Current URL: ${page.url()}`);
             console.log(`Visible buttons: ${visibleButtons.join(' | ') || 'none'}`);
-            throw new Error('Add to Wishlist did not open the Proceed popup. Restarting the round.');
+            throw new Error('Could not click Add to Wishlist. Restarting from the login page.');
         }
 
+        await checkoutFromProceed(page, firstProceedButton);
+    }
+
+    /**
+     * first "Proceed" (the Add-to-Wishlist popup OR the wishlist box) -> payment gateway page
+     * -> its single "Proceed" button -> "Booking Confirmation" popup.
+     * Throws unless the booking is confirmed by that popup.
+     */
+    async function checkoutFromProceed(page, firstProceedButton) {
         // ---- Phase 2: first Proceed -> payment page -> final Proceed ----
         try {
             await firstProceedButton.click();
@@ -1296,6 +1355,7 @@ function createBot(botId) {
 
         console.log('--- ✅ BOOKING CONFIRMED FOR THIS ROUND ---');
     }
+
 
     // -------------------------------------------------------------------------
     // --- 4. EXECUTION ---
