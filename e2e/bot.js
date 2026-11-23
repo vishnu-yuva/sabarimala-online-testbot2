@@ -250,6 +250,7 @@ function createBot(botId) {
                 const opened = await openSession();
                 browser = opened.browser;
                 const page = opened.page;
+                let nextFromDate = false; // true -> next round skips login and starts at date selection
 
                 while (remaining.length > 0 && !STOPPED) {
                     round++;
@@ -261,7 +262,9 @@ function createBot(botId) {
 
                     try {
                         // Returns rows only after the booking was CONFIRMED (see verifyBookingSuccess).
-                        const bookedRows = await runOneRound(page, remaining);
+                        const fromDate = nextFromDate;
+                        nextFromDate = false;
+                        const bookedRows = await runOneRound(page, remaining, fromDate);
 
                         if (!bookedRows || bookedRows.length === 0) {
                             throw new Error('No pilgrim could be booked in this round.');
@@ -279,9 +282,22 @@ function createBot(botId) {
                         }
                     } catch (err) {
                         if (STOPPED) break;
+
+                        // Site said "pending booking for the same slot / quota not available":
+                        // stay in this browser and retry from date selection (no new login).
+                        if (err && err.restartFromDate) {
+                            setStatus(remaining, 'pending', { slot: '', date: '' });
+                            setStep(`Round ${round}: slot not bookable right now. Retrying from date selection`);
+                            console.log(`🔁 Retrying from DATE SELECTION in ${RETRY_DELAY_MS / 1000}s (same browser, no new login)...`);
+                            nextFromDate = true;
+                            await sleep(RETRY_DELAY_MS);
+                            continue;
+                        }
+
                         failures++;
                         // Pilgrims that were "in progress" in this round go back to waiting.
                         setStatus(remaining, 'pending', { slot: '', date: '' });
+                        if (err && err.skipUser) setStep(`Round ${round}: previous booking not availed. Restarting from login`);
                         setStep(`Round ${round} failed. Retrying from login...`);
                         console.error(`⚠️ Round ${round} failed: ${String(err && err.message || err).split('\n')[0]}`);
                         console.log(`Still not booked: rows ${remaining.join(', ')}`);
@@ -332,11 +348,19 @@ function createBot(botId) {
      * for as many of the remaining pilgrims as the chosen slot has room for.
      * Returns the list of pilgrim rows ONLY if the booking was confirmed; otherwise it throws.
      */
-    async function runOneRound(page, remaining) {
-        console.log('--- STARTING LOGIN & NAVIGATION ---');
-        setStep(`Round ${progress.round}: logging in and checking the wishlist`);
-        const resumedRows = await loginAndOpenBookingPage(page, remaining);
-        if (resumedRows) return resumedRows; // the wishlist item was booked directly (slot was available)
+    async function runOneRound(page, remaining, fromDate) {
+        if (fromDate) {
+            // Same browser and same login: just reload the booking page and start at the date.
+            console.log('--- RETRY FROM DATE SELECTION (same browser, no new login) ---');
+            setStep(`Round ${progress.round}: reloading the page and selecting the date again`);
+            await page.reload();
+            await page.waitForSelector(ROUTE_SELECTOR, { state: 'visible', timeout: ACTION_TIMEOUT_MS });
+        } else {
+            console.log('--- STARTING LOGIN & NAVIGATION ---');
+            setStep(`Round ${progress.round}: logging in and checking the wishlist`);
+            const resumedRows = await loginAndOpenBookingPage(page, remaining);
+            if (resumedRows) return resumedRows; // the wishlist item was booked directly (slot was available)
+        }
 
         // Date selection (loops/refreshes until the target date is available)
         setStep(`Round ${progress.round}: waiting for the date to open`);
@@ -1263,6 +1287,31 @@ function createBot(botId) {
         }
     }
 
+    // Messages the site shows (in a .error-msg box) right after "Add to Wishlist":
+    //  - PENDING_SLOT: the slot cannot be booked right now  -> retry from DATE SELECTION (same browser)
+    //  - BLOCKED:      a previous booking was not availed   -> skip this attempt, close the browser, restart from LOGIN
+    // If neither message shows up, the checkout continues with the Proceed button as usual.
+    const MSG_PENDING_SLOT = /already having pending booking|sufficient quota is not available/i;
+    const MSG_BLOCKED = /cannot make transaction until you avail previous booking/i;
+
+    /**
+     * After "Add to Wishlist": waits up to 8 s for the Proceed popup or for one of the site's messages.
+     * Returns { type: 'popup' | 'pending-slot' | 'blocked' | 'none', text }.
+     */
+    async function waitForPopupOrMessage(page, proceedButton) {
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+            if (STOPPED) throw new Error('Stopped');
+            const texts = await page.locator('.error-msg:visible').allInnerTexts().catch(() => []);
+            const text = texts.join(' ').replace(/\s+/g, ' ').trim();
+            if (text && MSG_PENDING_SLOT.test(text)) return { type: 'pending-slot', text };
+            if (text && MSG_BLOCKED.test(text)) return { type: 'blocked', text };
+            if (await proceedButton.isVisible().catch(() => false)) return { type: 'popup', text: '' };
+            await page.waitForTimeout(250);
+        }
+        return { type: 'none', text: '' };
+    }
+
     /**
      * Handles the wishlist and proceed steps, then CONFIRMS the booking.
      * Throws a normal error if anything is not confirmed, so the round restarts,
@@ -1287,21 +1336,38 @@ function createBot(botId) {
                 continue;
             }
 
-            try {
-                await firstProceedButton.waitFor({ state: 'visible', timeout: 8000 });
+            const outcome = await waitForPopupOrMessage(page, firstProceedButton);
+
+            if (outcome.type === 'popup') {
                 popupShown = true;
-            } catch (e) {
-                console.log(`⚠️ Proceed popup did not appear after attempt ${attempt}. Page says: ${await pageProblemText(page)}`);
-                await dumpWishlistDiagnostics(page, 'popup missing');
-                // Do NOT click again or touch the form: after a successful "Add to Wishlist" the site
-                // resets the booking form (empty route/date, disabled button), so retrying here is useless
-                // and the wishlist is not cleared. Restart from the login page instead; the wishlist check
-                // right after login either finishes this booking (date matches + slot available) or clears it.
-                const siteAccepted = slotApiDiagnostics.some((l) => /addToWishlist\s+2\d\d/i.test(l));
-                throw new Error(siteAccepted
-                    ? 'The site accepted Add to Wishlist but the Proceed popup did not open (the item may be in the wishlist). Restarting from the login page; the wishlist is checked there.'
-                    : 'Add to Wishlist did not open the Proceed popup. Restarting from the login page.');
+                break;
             }
+
+            if (outcome.type === 'pending-slot') {
+                console.log(`⚠️ Site message: ${outcome.text}`);
+                const e = new Error('Pending booking for the same slot / quota not available. Retrying from date selection.');
+                e.restartFromDate = true;
+                throw e;
+            }
+
+            if (outcome.type === 'blocked') {
+                console.log(`🚫 Site message: ${outcome.text}`);
+                const e = new Error('Previous booking not availed, so this user cannot book now. Skipping this attempt, closing the browser and restarting from login.');
+                e.skipUser = true;
+                throw e;
+            }
+
+            // Neither message and no popup: unknown problem.
+            console.log(`⚠️ Proceed popup did not appear after attempt ${attempt}. Page says: ${await pageProblemText(page)}`);
+            await dumpWishlistDiagnostics(page, 'popup missing');
+            // Do NOT click again or touch the form: after a successful "Add to Wishlist" the site
+            // resets the booking form (empty route/date, disabled button), so retrying here is useless
+            // and the wishlist is not cleared. Restart from the login page instead; the wishlist check
+            // right after login either finishes this booking (date matches + slot available) or clears it.
+            const siteAccepted = slotApiDiagnostics.some((l) => /addToWishlist\s+2\d\d/i.test(l));
+            throw new Error(siteAccepted
+                ? 'The site accepted Add to Wishlist but the Proceed popup did not open (the item may be in the wishlist). Restarting from the login page; the wishlist is checked there.'
+                : 'Add to Wishlist did not open the Proceed popup. Restarting from the login page.');
         }
 
         if (!popupShown) {
