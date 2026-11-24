@@ -417,6 +417,9 @@ function createBot(botId) {
             setStep(`Round ${progress.round}: reloading the page and selecting the date again`);
             await page.reload();
             await page.waitForSelector(ROUTE_SELECTOR, { state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            // "Pending booking" usually means an item is sitting in the wishlist: continue or clear it.
+            const wl = await quickWishlistCheck(page, remaining, WISHLIST_WAIT_MS);
+            if (wl && wl.resumed) return wl.resumed;
         } else {
             console.log('--- STARTING LOGIN & NAVIGATION ---');
             setStep(`Round ${progress.round}: logging in and checking the wishlist`);
@@ -426,7 +429,8 @@ function createBot(botId) {
 
         // Date selection (loops/refreshes until the target date is available)
         setStep(`Round ${progress.round}: waiting for the date to open`);
-        const dateSelected = await selectDateOnly(page);
+        const dateSelected = await selectDateOnly(page, remaining);
+        if (dateSelected && dateSelected.resumedRows) return dateSelected.resumedRows; // booked from the wishlist
         if (!dateSelected) {
             throw new Error('Failed to select a date.');
         }
@@ -631,6 +635,46 @@ function createBot(botId) {
         return rows;
     }
 
+    /** Clicks "Clear Wishlist", confirms with "Yes" and waits until the item is really gone. */
+    async function clearWishlistNow(page, clearBtn) {
+        await clearBtn.click({ timeout: ACTION_TIMEOUT_MS });
+        console.log('Clicked "Clear Wishlist".');
+
+        // Confirmation popup: "Are you sure you want to clear the Wishlist?" -> Yes
+        const yesBtn = page.locator('button.btn-addto-pop:has-text("Yes")');
+        await yesBtn.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+        await yesBtn.click({ timeout: ACTION_TIMEOUT_MS });
+
+        // Wait until the Clear Wishlist button disappears (wishlist actually cleared)
+        await clearBtn.waitFor({ state: 'hidden', timeout: ACTION_TIMEOUT_MS });
+        console.log('✅ Wishlist cleared.');
+    }
+
+    /**
+     * QUICK wishlist check, used while the bot is already running (date loop, pending-booking message).
+     * It only LOOKS at the page: waitMs = 0 means "check right now, wait for nothing".
+     *   - no item                                   -> returns null
+     *   - item, date matches and slot available     -> books it (Proceed ...) and returns { resumed: rows }
+     *   - item otherwise                            -> clears it and returns { cleared: true }
+     */
+    async function quickWishlistCheck(page, remaining, waitMs) {
+        const clearBtn = page.locator('#wishlist-box button:has-text("Clear Wishlist")').first();
+        let found = false;
+        if (waitMs > 0) {
+            found = await clearBtn.waitFor({ state: 'visible', timeout: waitMs }).then(() => true).catch(() => false);
+        } else {
+            found = await clearBtn.isVisible().catch(() => false);
+        }
+        if (!found) return null;
+
+        console.log('⚠️ A wishlist item is on the page. Checking it (continue it if the date matches, otherwise clear it).');
+        const resumedRows = await resumeFromWishlistIfSlotAvailable(page, remaining);
+        if (resumedRows) return { resumed: resumedRows };
+
+        await clearWishlistNow(page, clearBtn);
+        return { cleared: true };
+    }
+
     /**
      * If the wishlist box has an item (the "Clear Wishlist" button is visible),
      * clears it and confirms the popup. Does nothing when the wishlist is empty.
@@ -691,17 +735,7 @@ function createBot(botId) {
                 if (handled) return handled;
             }
 
-            await clearBtn.click({ timeout: ACTION_TIMEOUT_MS });
-            console.log('Clicked "Clear Wishlist".');
-
-            // Confirmation popup: "Are you sure you want to clear the Wishlist?" -> Yes
-            const yesBtn = page.locator('button.btn-addto-pop:has-text("Yes")');
-            await yesBtn.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-            await yesBtn.click({ timeout: ACTION_TIMEOUT_MS });
-
-            // Wait until the Clear Wishlist button disappears (wishlist actually cleared)
-            await clearBtn.waitFor({ state: 'hidden', timeout: ACTION_TIMEOUT_MS });
-            console.log('✅ Wishlist cleared.');
+            await clearWishlistNow(page, clearBtn);
         } catch (err) {
             if (!err.fromResume) console.log(`⚠️ Wishlist clear failed: ${err.message.split('\n')[0]}`);
             throw err; // restarts the round so we never continue with a stale wishlist
@@ -754,7 +788,7 @@ function createBot(botId) {
      * Dynamically navigates the Angular Material calendar to the exact month and year
      * specified in TARGET_DATES and selects the exact target day (only if it is enabled).
      */
-    async function selectDateOnly(page) {
+    async function selectDateOnly(page, remaining) {
         console.log('--- STARTING DATE CHECK LOOP (Dynamic Month/Year Navigation) ---');
 
         const nextMonthBtn = page.locator('button.mat-calendar-next-button[aria-label="Next month"]');
@@ -780,6 +814,12 @@ function createBot(botId) {
                 await calendarBody.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
                 console.log('Calendar loaded. Checking available dates...');
             pickerFails = 0; // the page works again, so the error streak is over
+
+                // Instant wishlist look on every page load (no waiting): an item that appeared late,
+                // or that was added by hand, is continued or cleared here.
+                const wl = await quickWishlistCheck(page, remaining, 0);
+                if (wl && wl.resumed) return { resumedRows: wl.resumed };
+                if (wl && wl.cleared) continue; // wishlist is clean now: start this loop pass again
                 stage = 'checking target dates';
 
                 for (const targetDate of TARGET_DATES) {
@@ -908,6 +948,7 @@ function createBot(botId) {
 
             } catch (err) {
                 if (STOPPED) throw new Error('Stopped');
+                if (err && err.fromResume) throw err; // continuing from the wishlist failed: restart from login
                 console.log(`Error while checking dates (${stage}): ${err.message.split('\n')[0]}`);
                 if (page.isClosed()) throw new Error('The page was closed.');
                 if (await page.locator('#email').isVisible().catch(() => false)) {
@@ -1362,7 +1403,7 @@ function createBot(botId) {
     const MSG_BLOCKED = /cannot make transaction until you avail previous booking/i;
 
     /**
-     * After "Add to Wishlist": waits up to 8 s for the Proceed popup or for one of the site's messages.
+     * After "Add to Wishlist": waits up to 8 s for the Proceed popup or one of the site's messages.
      * Returns { type: 'popup' | 'pending-slot' | 'blocked' | 'none', text }.
      */
     async function waitForPopupOrMessage(page, proceedButton) {
@@ -1374,6 +1415,7 @@ function createBot(botId) {
             if (text && MSG_PENDING_SLOT.test(text)) return { type: 'pending-slot', text };
             if (text && MSG_BLOCKED.test(text)) return { type: 'blocked', text };
             if (await proceedButton.isVisible().catch(() => false)) return { type: 'popup', text: '' };
+
             await page.waitForTimeout(250);
         }
         return { type: 'none', text: '' };
@@ -1388,6 +1430,12 @@ function createBot(botId) {
         console.log('--- STARTING FINAL CHECKOUT STEPS ---');
 
         const firstProceedButton = page.locator('button:visible:has-text("Proceed")').first();
+
+        // An item already in the wishlist (added by hand / loaded late) must not get a second one on top.
+        // Restart from login: the wishlist check there continues it (date matches) or clears it.
+        if (await page.locator('#wishlist-box button:has-text("Clear Wishlist")').first().isVisible().catch(() => false)) {
+            throw new Error('A wishlist item is on the page before Add to Wishlist. Restarting from login so it is continued or cleared first.');
+        }
 
         // ---- Phase 1: Add to Wishlist -> wait for the Proceed popup (retry the click if needed) ----
         let popupShown = false;
