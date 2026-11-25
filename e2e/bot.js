@@ -637,6 +637,9 @@ function createBot(botId) {
 
     /** Clicks "Clear Wishlist", confirms with "Yes" and waits until the item is really gone. */
     async function clearWishlistNow(page, clearBtn) {
+        // An open date picker (or any dialog) puts an overlay over the page that swallows clicks.
+        await page.keyboard.press('Escape').catch(() => {});
+        await page.locator('.cdk-overlay-backdrop').first().waitFor({ state: 'detached', timeout: 2000 }).catch(() => {});
         await clearBtn.click({ timeout: ACTION_TIMEOUT_MS });
         console.log('Clicked "Clear Wishlist".');
 
@@ -806,6 +809,13 @@ function createBot(botId) {
             try {
                 await calendarToggleButton.waitFor({ state: 'visible', timeout: DATE_PAGE_WAIT_MS });
 
+                // Instant wishlist look (no waiting) while the calendar is still CLOSED. The open calendar
+                // covers the page with an overlay that blocks clicks, so "Clear Wishlist" must never be
+                // clicked while it is open.
+                stage = 'checking the wishlist';
+                const wl1 = await quickWishlistCheck(page, remaining, 0);
+                if (wl1 && wl1.resumed) return { resumedRows: wl1.resumed };
+
                 stage = 'opening the date picker';
                 if (!await calendarBody.isVisible()) {
                     await calendarToggleButton.click({ timeout: ACTION_TIMEOUT_MS });
@@ -814,12 +824,6 @@ function createBot(botId) {
                 await calendarBody.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
                 console.log('Calendar loaded. Checking available dates...');
             pickerFails = 0; // the page works again, so the error streak is over
-
-                // Instant wishlist look on every page load (no waiting): an item that appeared late,
-                // or that was added by hand, is continued or cleared here.
-                const wl = await quickWishlistCheck(page, remaining, 0);
-                if (wl && wl.resumed) return { resumedRows: wl.resumed };
-                if (wl && wl.cleared) continue; // wishlist is clean now: start this loop pass again
                 stage = 'checking target dates';
 
                 for (const targetDate of TARGET_DATES) {
@@ -941,6 +945,14 @@ function createBot(botId) {
                 } else {
                     // Close the calendar with Escape (clicking the toggle again can be blocked by the overlay)
                     await page.keyboard.press('Escape').catch(() => {});
+
+                    // Second instant wishlist look: the calendar is closed again and the wishlist has had
+                    // the whole pass to load, so an item that showed up late is caught here.
+                    stage = 'checking the wishlist';
+                    const wl2 = await quickWishlistCheck(page, remaining, 0);
+                    if (wl2 && wl2.resumed) return { resumedRows: wl2.resumed };
+                    if (wl2 && wl2.cleared) continue; // wishlist is clean: check the dates again right away
+
                     console.log('No available dates. Refreshing in about 7 seconds...');
                     await page.waitForTimeout(refreshPause());
                     await reloadAndReport(page);
