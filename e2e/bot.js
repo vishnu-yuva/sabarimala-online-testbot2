@@ -52,7 +52,7 @@ function createBot(botId) {
         for (const it of progress.items) {
             if (rows.includes(it.row)) {
                 Object.assign(it, { status }, extra || {});
-                if (status !== 'pending') it.note = ''; // moving on: the old message no longer applies
+                if (status !== 'pending' && !(extra && 'note' in extra)) it.note = ''; // moving on: the old message no longer applies
             }
         }
         emitProgress();
@@ -256,6 +256,9 @@ function createBot(botId) {
         // Pilgrims the site refused with "You cannot make transaction until you avail previous booking".
         // They are skipped while other pilgrims are still waiting, and tried again when those are done.
         let skipped = [];
+        let retryingSkipped = false;        // true while the previously skipped pilgrims are being tried again
+        let skippedGroup = [];              // the pilgrims that were skipped, when this second phase started
+        const editedRows = new Set();       // pilgrims whose Photo ID was already changed (done at most once)
         let forceCooldown = false; // true when only skipped pilgrims are left (wait before trying them again)
         const syncSkipped = () => {
             for (const it of progress.items) it.skipped = skipped.includes(it.row);
@@ -287,6 +290,8 @@ function createBot(botId) {
                     let pending = remaining.filter((r) => !skipped.includes(r));
                     if (pending.length === 0 && skipped.length > 0) {
                         console.log(`\n🔄 All other pilgrims are done. Trying the skipped pilgrim(s) again: rows ${skipped.join(', ')}`);
+                        retryingSkipped = true;
+                        skippedGroup = [...skipped];
                         skipped = [];
                         syncSkipped();
                         pending = [...remaining];
@@ -335,6 +340,39 @@ function createBot(botId) {
 
                         // Site said "You cannot make transaction until you avail previous booking":
                         // skip THESE pilgrims for now, carry on with the others, retry the skipped ones last.
+                        // The skipped pilgrims are blocked AGAIN: change their pilgrim details (Photo ID),
+                        // then restart from login and book them.
+                        if (err && err.skipUser && retryingSkipped) {
+                            const toEdit = skippedGroup.filter((r) => remaining.includes(r) && !editedRows.has(r));
+                            if (toEdit.length > 0) {
+                                console.log(`\n🛠 The skipped pilgrim(s) are still blocked. Changing the pilgrim details (Photo ID -> Voter ID) of rows: ${toEdit.join(', ')}`);
+                                setStep(`Changing pilgrim details (Photo ID) of row(s) ${toEdit.join(', ')}`);
+                                try {
+                                    const res = await changePilgrimDetails(page, toEdit);
+                                    res.edited.forEach((r) => editedRows.add(r));
+                                    if (res.removed.length) {
+                                        remaining = remaining.filter((r) => !res.removed.includes(r));
+                                        setStatus(res.removed, 'removed', { note: 'No Edit button on the Pilgrim List (already booked). Removed from this booking.', slot: '', date: '' });
+                                        console.log(`🗑 Removed from the booking list: rows ${res.removed.join(', ')}`);
+                                    }
+                                    console.log(`🛠 Details changed for rows: ${res.edited.length ? res.edited.join(', ') : 'none'}${res.failed.length ? `   |   could not change rows: ${res.failed.join(', ')}` : ''}`);
+                                } catch (editErr) {
+                                    if (STOPPED) break;
+                                    console.log(`⚠️ Changing the pilgrim details stopped: ${editErr.message.split('\n')[0]}`);
+                                }
+                                retryingSkipped = false;
+                                skipped = [];
+                                skippedGroup = [];
+                                syncSkipped();
+                                setStatus(remaining, 'pending', { slot: '', date: '' });
+                                logSummary();
+                                setStep('Pilgrim details changed. Restarting from login to book them');
+                                console.log('🔁 Closing the browser and restarting from LOGIN to book these pilgrim(s)...');
+                                break;
+                            }
+                            // all of them were edited before: fall through to the normal skip handling below
+                        }
+
                         if (err && err.skipUser) {
                             const rows = (err.rows && err.rows.length) ? err.rows : pending.slice(0, 1);
                             skipped = [...new Set([...skipped, ...rows])];
@@ -401,7 +439,10 @@ function createBot(botId) {
         if (STOPPED) {
             console.log('\n⏹ Stopped by user.');
         } else {
-            console.log('\n🎉 ALL PILGRIMS ARE BOOKED. Automation finished.');
+            const removedCount = progress.items.filter((i) => i.status === 'removed').length;
+            console.log(removedCount
+                ? `\n🎉 Automation finished. Booked: ${progress.items.filter((i) => i.status === 'booked').length}, removed (already booked): ${removedCount}.`
+                : '\n🎉 ALL PILGRIMS ARE BOOKED. Automation finished.');
         }
     }
 
@@ -1088,6 +1129,169 @@ function createBot(botId) {
     }
 
     const normalizeText = (t) => String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+    // ---------------------------------------------------------------------
+    // Changing a pilgrim's Photo ID (used for skipped pilgrims that the site keeps blocking with
+    // "You cannot make transaction until you avail previous booking").
+    // Flow: account menu -> Pilgrim List -> Edit -> Photo ID Type = Voter ID -> random Voter ID number
+    //       -> Update -> OK on the success popup.
+    // ---------------------------------------------------------------------
+    const VOTER_ID_VALUE = '10007'; // <option value="10007">Voter ID</option>
+
+    /** Voter ID: 3 random capital letters followed by 7 random digits (10 characters), e.g. KTR4821937. */
+    function randomVoterId() {
+        const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        let id = '';
+        for (let i = 0; i < 3; i++) id += letters[Math.floor(Math.random() * letters.length)];
+        for (let i = 0; i < 7; i++) id += Math.floor(Math.random() * 10);
+        return id;
+    }
+
+    /** Opens the account menu and clicks "Pilgrim List" (the page only opens this way, not by address). */
+    async function openPilgrimList(page) {
+        if (!/pilgrimList/i.test(page.url())) {
+            const menu = page.locator('span.nav-link.logout-name').first();
+            await menu.waitFor({ state: 'attached', timeout: ACTION_TIMEOUT_MS });
+            try {
+                await menu.click({ timeout: 3000 });
+            } catch (e) {
+                await menu.evaluate((el) => el.click()); // the icon span can have no size; click it directly
+            }
+            const item = page.locator('div[routerlink="/pilgrimList"]').first();
+            await item.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            await Promise.all([
+                page.waitForURL('**/pilgrimList', { timeout: ACTION_TIMEOUT_MS }),
+                item.click({ timeout: ACTION_TIMEOUT_MS }),
+            ]);
+        }
+        await page.waitForSelector('tr.mat-row, mat-row', { timeout: ACTION_TIMEOUT_MS });
+        console.log('Opened the Pilgrim List page.');
+    }
+
+    /**
+     * Finds the row of a pilgrim (original row number) on the Pilgrim List page.
+     * The pilgrim is recognised by the text remembered from the selection page (name, age ...);
+     * if nothing was remembered, the same row number is used. Returns a locator or null.
+     */
+    async function findPilgrimListRow(page, originalRow) {
+        const rows = page.locator('tr.mat-row, mat-row');
+        const count = await rows.count();
+        const texts = [];
+        for (let i = 0; i < count; i++) texts.push(normalizeText(await rows.nth(i).innerText().catch(() => '')));
+
+        const identity = pilgrimIdentity[originalRow];
+        if (!identity) {
+            if (originalRow - 1 < count) {
+                console.log(`ℹ️ No saved details for pilgrim row ${originalRow}; using row ${originalRow} of the Pilgrim List.`);
+                return rows.nth(originalRow - 1);
+            }
+            return null;
+        }
+
+        // Score each list row by how many of ITS words (name, age, gender ...) appear in the text saved
+        // for this pilgrim on the selection page. (The saved text can contain extra words, so the row's
+        // own words are the reliable side.)
+        const ignore = new Set(['edit', 'delete', 'view', 'action', 'actions']);
+        const wordsOf = (t) => [...new Set(String(t).split(/[^a-z0-9]+/).filter((w) => w.length >= 2 && !ignore.has(w)))];
+        const scoreOf = (t) => {
+            const words = wordsOf(t);
+            return words.length ? words.filter((w) => identity.includes(w)).length / words.length : 0;
+        };
+
+        const scores = texts.map(scoreOf);
+        const bestScore = Math.max(0, ...scores);
+        if (bestScore < 0.6) return null;
+        const winners = scores.map((sc, i) => (sc === bestScore ? i : -1)).filter((i) => i >= 0);
+        // several equally good rows: prefer the same row number, otherwise the first one
+        const best = winners.includes(originalRow - 1) ? originalRow - 1 : winners[0];
+        console.log(`Pilgrim row ${originalRow} is row ${best + 1} on the Pilgrim List (match ${Math.round(bestScore * 100)}%).`);
+        return rows.nth(best);
+    }
+
+    /** On the edit page: Photo ID Type = Voter ID, a new random Voter ID number, Update, OK. */
+    async function changePhotoIdToVoterId(page) {
+        const typeSelect = page.locator('select[name="proofId"]').first();
+        await typeSelect.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+
+        try {
+            await typeSelect.selectOption(VOTER_ID_VALUE);
+        } catch (e) {
+            await typeSelect.selectOption({ label: 'Voter ID' });
+        }
+        const chosen = await typeSelect.evaluate((el) => el.options[el.selectedIndex] && el.options[el.selectedIndex].text.trim());
+        console.log(`Photo ID Type selected: ${chosen}`);
+
+        const voterId = randomVoterId();
+        const numberInput = page.locator('input[name="proofIdNum"]').first();
+        await numberInput.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+        await numberInput.fill(voterId);
+        await numberInput.press('Tab'); // blur so the page validates the new number
+        console.log(`Photo ID Number entered: ${voterId}`);
+
+        await page.locator('button#regi_continue:has-text("Update")').first().click({ timeout: ACTION_TIMEOUT_MS });
+
+        // Popup: "Pilgrim Details has been updated successfully."  -> OK
+        const popup = page.locator('.feedback_form').first();
+        await popup.waitFor({ state: 'visible', timeout: SLOW_WAIT_MS });
+        const text = ((await popup.innerText()) || '').replace(/\s+/g, ' ').trim();
+        if (!/updated successfully/i.test(text)) {
+            throw new Error(`The site did not confirm the update. Popup says: ${text.slice(0, 200)}`);
+        }
+        const shown = ((await popup.locator('.content').first().innerText().catch(() => '')) || text).replace(/\s+/g, ' ').trim();
+        console.log(`✅ ${shown.slice(0, 100)}`);
+        await popup.locator('button:has-text("OK")').filter({ hasText: /^\s*ok\s*$/i }).first().click({ timeout: ACTION_TIMEOUT_MS });
+        await popup.waitFor({ state: 'hidden', timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+        return voterId;
+    }
+
+    /**
+     * Changes the Photo ID of every given pilgrim (original row numbers).
+     * Returns { edited: [rows], removed: [rows], failed: [rows] }
+     *   edited  - Photo ID changed to a new Voter ID
+     *   removed - NO Edit button on the Pilgrim List (that pilgrim is already booked / has a transaction):
+     *             not edited, and to be dropped from this bot's booking list
+     *   failed  - something went wrong for this pilgrim (not found, update refused ...)
+     */
+    async function changePilgrimDetails(page, rows) {
+        const result = { edited: [], removed: [], failed: [] };
+        for (const row of rows) {
+            if (STOPPED) throw new Error('Stopped');
+            try {
+                console.log(`--- CHANGING DETAILS OF PILGRIM ROW ${row} ---`);
+                await openPilgrimList(page);
+
+                const listRow = await findPilgrimListRow(page, row);
+                if (!listRow) {
+                    console.log(`⚠️ Pilgrim row ${row} was not found on the Pilgrim List. Not edited.`);
+                    result.failed.push(row);
+                    continue;
+                }
+
+                const editButton = listRow.locator('.btn-edit').first();
+                if (!(await editButton.isVisible().catch(() => false))) {
+                    console.log(`🗑 Pilgrim row ${row} has no Edit button (already booked). Not edited; it will be removed from the booking list.`);
+                    result.removed.push(row);
+                    continue;
+                }
+
+                // The edit page only opens by clicking Edit (it cannot be opened by address).
+                await Promise.all([
+                    page.waitForURL('**/editPilgrim', { timeout: ACTION_TIMEOUT_MS }),
+                    editButton.click({ timeout: ACTION_TIMEOUT_MS }),
+                ]);
+                console.log('Opened the Edit Pilgrim page.');
+
+                await changePhotoIdToVoterId(page);
+                result.edited.push(row);
+            } catch (e) {
+                console.log(`⚠️ Could not change the details of pilgrim row ${row}: ${e.message.split('\n')[0]}`);
+                result.failed.push(row);
+                // go back to a known page so the next pilgrim starts clean
+                await page.goto('https://sabarimalaonline.org/#/darshan').catch(() => {});
+            }
+        }
+        return result;
+    }
 
     /**
      * Selects the given pilgrim rows (original row numbers from PILGRIM_ROWS).
